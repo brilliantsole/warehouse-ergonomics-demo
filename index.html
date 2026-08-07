@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Brilliant Wear — Warehouse Ergonomics Demo</title>
+<style>
+  :root {
+    --navy: #1a1f47; --navy-2: #12163a; --panel: #21265c; --panel-2: #2a3070;
+    --teal: #00d4aa; --teal-dim: #0aa88a; --amber: #ffb020; --red: #ff5468;
+    --text: #eef1ff; --muted: #9aa3c7; --line: #343b7a;
+    font-size: 16px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "SF Pro Text", Inter, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(1200px 600px at 70% -10%, #232a68 0%, var(--navy) 45%, var(--navy-2) 100%);
+    color: var(--text); min-height: 100vh; padding: 20px 24px 48px;
+  }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand h1 { font-size: 1.15rem; letter-spacing: .12em; font-weight: 700; }
+  .brand h1 .thin { color: var(--teal); font-weight: 500; }
+  .brand .sub { color: var(--muted); font-size: .85rem; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; }
+  button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    padding: 9px 14px; border-radius: 9px; font-size: .85rem; cursor: pointer; transition: all .15s;
+  }
+  button:hover { border-color: var(--teal); }
+  button.primary { background: var(--teal); border-color: var(--teal); color: #06251d; font-weight: 650; }
+  button.connected { background: var(--teal-dim); border-color: var(--teal-dim); color: #04211a; font-weight: 650; }
+  button.danger { border-color: var(--red); color: var(--red); }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(12, 1fr); }
+  .card {
+    grid-column: span 4; background: linear-gradient(180deg, var(--panel) 0%, rgba(33,38,92,.6) 100%);
+    border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 14px; min-height: 120px;
+  }
+  .card h2 { font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
+  .card .big { font-size: 2rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .card .unit { font-size: .8rem; color: var(--muted); margin-left: 4px; }
+  @media (max-width: 1100px) { .card { grid-column: span 6; } }
+  @media (max-width: 680px)  { .card { grid-column: span 12; } }
+  .span6 { grid-column: span 6 !important; }
+  .span12 { grid-column: span 12 !important; }
+  @media (max-width: 1100px) { .span6 { grid-column: span 12 !important; } }
+  .feet { display: flex; gap: 18px; justify-content: center; align-items: flex-start; }
+  canvas.foot { background: transparent; }
+  .loadbar { height: 14px; border-radius: 7px; background: var(--navy-2); border: 1px solid var(--line); overflow: hidden; display: flex; margin-top: 10px; }
+  .loadbar .left { background: var(--teal); transition: width .12s linear; }
+  .loadbar .right { background: #6f7bff; flex: 1; transition: width .12s linear; }
+  .loadlabels { display: flex; justify-content: space-between; color: var(--muted); font-size: .75rem; margin-top: 4px; }
+  .gauge-wrap { display: flex; gap: 14px; align-items: center; }
+  .gauge-side { flex: 1; }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: .75rem; font-weight: 650; letter-spacing: .06em; }
+  .pill.green { background: rgba(0,212,170,.15); color: var(--teal); }
+  .pill.amber { background: rgba(255,176,32,.15); color: var(--amber); }
+  .pill.red { background: rgba(255,84,104,.18); color: var(--red); }
+  .kv { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px dashed rgba(52,59,122,.6); font-size: .85rem; }
+  .kv:last-child { border-bottom: none; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+  #log { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: .74rem; color: var(--muted); height: 132px; overflow-y: auto; line-height: 1.55; }
+  #log .t { color: var(--teal); }
+  #log .warn { color: var(--amber); }
+  #log .bad { color: var(--red); }
+  .statusdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--red); margin-right: 6px; }
+  .statusdot.on { background: var(--teal); }
+  .footer-note { margin-top: 16px; color: var(--muted); font-size: .75rem; }
+  .toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: .82rem; cursor: pointer; user-select: none; }
+  .toggle input { accent-color: var(--teal); width: 16px; height: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>BRILLIANT<span class="thin">WEAR</span></h1>
+    <span class="sub">Warehouse Ergonomics Demo — footsteps · balance · center of pressure · posture</span>
+  </div>
+  <div class="controls">
+    <button id="btn-insoles">⊙ Connect Insoles</button>
+    <button id="btn-torso">⊙ Connect Torso Sense</button>
+    <button id="btn-pelvis">⊙ Connect Pelvis Sense</button>
+    <button id="btn-sim" class="primary">▶ Simulate</button>
+    <button id="btn-reset" class="danger">Reset Session</button>
+  </div>
+</header>
+
+<div class="grid">
+  <!-- Center of pressure -->
+  <div class="card span6">
+    <h2><span class="statusdot" id="dot-insoles"></span>Center of Pressure & Balance</h2>
+    <div class="feet">
+      <canvas id="foot-left" class="foot" width="150" height="320"></canvas>
+      <canvas id="cop" width="220" height="320"></canvas>
+      <canvas id="foot-right" class="foot" width="150" height="320"></canvas>
+    </div>
+    <div class="loadbar"><div class="left" id="load-left" style="width:50%"></div><div class="right" id="load-right"></div></div>
+    <div class="loadlabels"><span>L <b id="load-left-pct">50%</b></span><span>Stability <b id="stability">—</b></span><span><b id="load-right-pct">50%</b> R</span></div>
+  </div>
+
+  <!-- Posture -->
+  <div class="card span6">
+    <h2><span class="statusdot" id="dot-torso"></span>Lifting Posture <span id="posture-pill" class="pill green" style="margin-left:8px">SAFE</span></h2>
+    <div class="gauge-wrap">
+      <canvas id="gauge" width="260" height="170"></canvas>
+      <div class="gauge-side">
+        <div class="kv"><span class="k">Trunk flexion</span><span class="v" id="flexion">0°</span></div>
+        <div class="kv"><span class="k">Lateral lean</span><span class="v" id="lean">0°</span></div>
+        <div class="kv"><span class="k">Twist</span><span class="v" id="twist">0°</span></div>
+        <div class="kv"><span class="k">Pelvis delta (hinge)</span><span class="v" id="hinge">—</span></div>
+        <div class="kv"><span class="k">Lift form</span><span class="v" id="liftform">—</span></div>
+        <div class="kv"><span class="k">Time in red</span><span class="v" id="redtime">0.0s</span></div>
+      </div>
+    </div>
+    <label class="toggle" style="margin-top:8px"><input type="checkbox" id="haptic-toggle" checked />Haptic coaching — buzz insoles when posture goes red</label>
+  </div>
+
+  <!-- Footstep map -->
+  <div class="card span6">
+    <h2>Footstep Map — last 10 seconds</h2>
+    <canvas id="stepmap" width="640" height="240" style="width:100%"></canvas>
+    <div class="loadlabels"><span style="color:var(--teal)">● Left</span><span class="k" style="color:var(--muted)">numbered in sequence · fades after 10 s</span><span style="color:#6f7bff">● Right</span></div>
+  </div>
+
+  <!-- Gait -->
+  <div class="card">
+    <h2>Footsteps</h2>
+    <div><span class="big" id="steps">0</span><span class="unit">steps</span></div>
+    <div class="kv"><span class="k">Cadence</span><span class="v" id="cadence">— spm</span></div>
+    <div class="kv"><span class="k">L/R asymmetry</span><span class="v" id="asym">—</span></div>
+  </div>
+
+  <!-- Lifts -->
+  <div class="card">
+    <h2>Box Lifts</h2>
+    <div><span class="big" id="lifts">0</span><span class="unit">lifts</span></div>
+    <div class="kv"><span class="k">Good form</span><span class="v" id="lifts-good" style="color:var(--teal)">0</span></div>
+    <div class="kv"><span class="k">Risky form</span><span class="v" id="lifts-bad" style="color:var(--red)">0</span></div>
+  </div>
+
+  <!-- Session log -->
+  <div class="card">
+    <h2>Session Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<p class="footer-note">
+  Runs entirely in the browser over Web Bluetooth (Chrome/Edge). No install. Built on the open
+  <a href="https://github.com/brilliantsole/BrilliantWear-JavaScript-SDK" style="color:var(--teal)">Brilliant Wear JavaScript SDK</a>.
+  Simulate mode previews the full experience without hardware.
+</p>
+
+<script src="https://unpkg.com/brilliantsole@latest/build/brilliantsole.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
