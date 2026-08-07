@@ -41,11 +41,21 @@
   .card .unit { font-size: .8rem; color: var(--muted); margin-left: 4px; }
   @media (max-width: 1100px) { .card { grid-column: span 6; } }
   @media (max-width: 680px)  { .card { grid-column: span 12; } }
+  .span5 { grid-column: span 5 !important; }
   .span6 { grid-column: span 6 !important; }
+  .span7 { grid-column: span 7 !important; }
   .span12 { grid-column: span 12 !important; }
-  @media (max-width: 1100px) { .span6 { grid-column: span 12 !important; } }
-  .feet { display: flex; gap: 18px; justify-content: center; align-items: flex-start; }
-  canvas.foot { background: transparent; }
+  @media (max-width: 1100px) { .span5, .span6, .span7 { grid-column: span 12 !important; } }
+  /* real shoe artwork stage — golf shoe model + sensor-bed overlay, light "product render" card */
+  .shoe-stage { display: flex; justify-content: center; }
+  .shoe-frame {
+    background: linear-gradient(180deg, #fdfdff 0%, #e9edf6 100%);
+    border-radius: 12px; border: 1px solid rgba(255,255,255,.14);
+    box-shadow: inset 0 0 40px rgba(26,31,71,.08); padding: 6px;
+  }
+  .shoe-frame svg { display: block; height: 380px; width: auto; max-width: 100%; }
+  @media (max-width: 680px) { .shoe-frame svg { height: 300px; } }
+  .shoe-fallback { color: var(--muted); font-size: .8rem; padding: 40px 20px; text-align: center; }
   .loadbar { height: 14px; border-radius: 7px; background: var(--navy-2); border: 1px solid var(--line); overflow: hidden; display: flex; margin-top: 10px; }
   .loadbar .left { background: var(--teal); transition: width .12s linear; }
   .loadbar .right { background: #6f7bff; flex: 1; transition: width .12s linear; }
@@ -88,19 +98,19 @@
 
 <div class="grid">
   <!-- Center of pressure -->
-  <div class="card span6">
+  <div class="card span7">
     <h2><span class="statusdot" id="dot-insoles"></span>Center of Pressure & Balance</h2>
-    <div class="feet">
-      <canvas id="foot-left" class="foot" width="150" height="320"></canvas>
-      <canvas id="cop" width="220" height="320"></canvas>
-      <canvas id="foot-right" class="foot" width="150" height="320"></canvas>
+    <div class="shoe-stage">
+      <div class="shoe-frame" id="shoe-frame">
+        <div class="shoe-fallback">loading shoe artwork…</div>
+      </div>
     </div>
     <div class="loadbar"><div class="left" id="load-left" style="width:50%"></div><div class="right" id="load-right"></div></div>
     <div class="loadlabels"><span>L <b id="load-left-pct">50%</b></span><span>Stability <b id="stability">—</b></span><span><b id="load-right-pct">50%</b> R</span></div>
   </div>
 
   <!-- Posture -->
-  <div class="card span6">
+  <div class="card span5">
     <h2><span class="statusdot" id="dot-torso"></span>Lifting Posture <span id="posture-pill" class="pill green" style="margin-left:8px">SAFE</span></h2>
     <div class="gauge-wrap">
       <canvas id="gauge" width="260" height="170"></canvas>

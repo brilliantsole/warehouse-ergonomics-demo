@@ -20,7 +20,7 @@
     stepThreshold: 0.55,         // normalized side-load crossing for a step
     stepRefractoryMs: 300,
     hapticCooldownMs: 2000,
-    copTrail: 60,
+    copTrail: 40,               // matches the trail-circle pool in assets/shoes.svg
     stabilityWindowMs: 3000,
   };
 
@@ -296,7 +296,12 @@
             onSideLoad(side, p.normalizedSum);
           }
           if (side && Array.isArray(p?.sensors)) {
-            S.sensors[side] = p.sensors.map((s) => s.normalizedValue ?? s.value ?? 0);
+            // TODO[SDK]: SDK sensor order vs. artwork pad order. Pads are anatomical
+            // (0:heel..7:hallux, see PAD_POS). If hardware order differs, fix this map.
+            const SDK_SENSOR_TO_PAD = [0, 1, 2, 3, 4, 5, 6, 7];
+            p.sensors.forEach((s, i) => {
+              S.sensors[side][SDK_SENSOR_TO_PAD[i]] = s.normalizedValue ?? s.value ?? 0;
+            });
           }
         });
         // Ask each insole to stream pressure
@@ -404,62 +409,68 @@
   }
 
   // ---------- rendering ----------
-  const footL = $("foot-left").getContext("2d");
-  const footR = $("foot-right").getContext("2d");
-  const copCtx = $("cop").getContext("2d");
   const gaugeCtx = $("gauge").getContext("2d");
-  // sensor layout (normalized foot coords), heel → toes
-  const SENSOR_POS = [
-    [0.5, 0.9], [0.34, 0.82], [0.66, 0.82],       // heel
-    [0.38, 0.58], [0.62, 0.58],                   // midfoot
-    [0.3, 0.32], [0.52, 0.26], [0.72, 0.3],       // forefoot
-  ];
 
-  function drawFoot(ctx, sensors, mirror) {
-    const w = ctx.canvas.width, h = ctx.canvas.height;
-    ctx.clearRect(0, 0, w, h);
-    ctx.save();
-    if (mirror) { ctx.translate(w, 0); ctx.scale(-1, 1); }
-    // outline
-    ctx.beginPath();
-    ctx.ellipse(w * 0.5, h * 0.62, w * 0.3, h * 0.34, 0, 0, Math.PI * 2);
-    ctx.ellipse(w * 0.48, h * 0.2, w * 0.26, h * 0.14, -0.15, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(42,48,112,.55)"; ctx.fill();
-    ctx.strokeStyle = "#343b7a"; ctx.stroke();
-    // sensors
-    sensors.forEach((v, i) => {
-      const [nx, ny] = SENSOR_POS[i];
-      const r = 7 + v * 9;
-      const g = ctx.createRadialGradient(w * nx, h * ny, 1, w * nx, h * ny, r);
-      g.addColorStop(0, `rgba(0,212,170,${0.25 + v * 0.75})`);
-      g.addColorStop(1, "rgba(0,212,170,0)");
-      ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(w * nx, h * ny, r, 0, Math.PI * 2); ctx.fill();
-    });
-    ctx.restore();
-  }
+  // Real shoe artwork: assets/shoes.svg (golf shoe model + sensor-bed overlay).
+  // Pads are vector paths id'd pad-{left,right}-{i} in anatomical order:
+  // 0:heel 1:midMed 2:midLat 3:ballMed 4:ballCtr 5:ballLat 6:foreLat 7:hallux.
+  // The shoe render sits on top at 75% opacity, so pad color glows through it.
+  // Pad centers in the svg's viewBox coordinate space (for Zack / COP tuning):
+  const PAD_POS = {
+    left:  [[327,819], [413,598], [256,616], [447,351], [353,372], [265,404], [315,281], [419,232]],
+    right: [[822,822], [744,598], [900,623], [720,350], [813,375], [900,410], [854,285], [752,232]],
+  };
+  // normalized COP (0..1) maps into this viewBox rect (pad bounds + margin)
+  const COP_RECT = { x: 201, y: 177, w: 754, h: 700 };
+  const PAD_RGB = { left: "0,212,170", right: "111,123,255" }; // matches L/R legend colors
 
-  function drawCop() {
-    const w = copCtx.canvas.width, h = copCtx.canvas.height;
-    copCtx.clearRect(0, 0, w, h);
-    copCtx.strokeStyle = "#343b7a"; copCtx.setLineDash([4, 4]);
-    copCtx.strokeRect(10, 10, w - 20, h - 20);
-    copCtx.setLineDash([]);
-    copCtx.fillStyle = "rgba(154,163,199,.5)";
-    copCtx.font = "10px sans-serif";
-    copCtx.fillText("center of pressure", 14, 22);
-    S.copTrail.forEach((p, i) => {
-      const a = i / S.copTrail.length;
-      copCtx.fillStyle = `rgba(0,212,170,${a * 0.5})`;
-      copCtx.beginPath();
-      copCtx.arc(10 + p.x * (w - 20), 10 + p.y * (h - 20), 2 + a * 2, 0, Math.PI * 2);
-      copCtx.fill();
-    });
-    copCtx.fillStyle = "#00d4aa";
-    copCtx.beginPath();
-    copCtx.arc(10 + S.cop.x * (w - 20), 10 + S.cop.y * (h - 20), 6, 0, Math.PI * 2);
-    copCtx.fill();
-  }
+  const ShoeStage = {
+    ready: false, pads: { left: [], right: [] }, trail: [], dot: null,
+    async init() {
+      const frame = $("shoe-frame");
+      try {
+        const res = await fetch("assets/shoes.svg");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        frame.innerHTML = await res.text();
+        for (const side of ["left", "right"]) {
+          this.pads[side] = PAD_POS[side].map((_, i) => frame.querySelector(`#pad-${side}-${i}`));
+        }
+        this.trail = [...frame.querySelectorAll(".cop-trail")];
+        this.dot = frame.querySelector("#cop-dot");
+        this.ready = true;
+      } catch (err) {
+        frame.innerHTML = `<div class="shoe-fallback">Shoe artwork needs an http server (python3 -m http.server) — data still streams below.</div>`;
+        log(`Shoe artwork not loaded: ${err.message}`, "warn");
+      }
+    },
+    render() {
+      if (!this.ready) return;
+      for (const side of ["left", "right"]) {
+        const rgb = PAD_RGB[side];
+        S.sensors[side].forEach((v, i) => {
+          const pad = this.pads[side][i];
+          if (!pad) return;
+          if (v <= 0.02) {                       // idle: neutral, circuit shows through
+            pad.style.fill = "#0e1330"; pad.style.opacity = "0.16";
+          } else {
+            pad.style.fill = `rgb(${rgb})`;
+            pad.style.opacity = (0.14 + 0.86 * Math.min(1, v)).toFixed(3);
+          }
+        });
+      }
+      const cx = (COP_RECT.x + S.cop.x * COP_RECT.w).toFixed(1);
+      const cy = (COP_RECT.y + S.cop.y * COP_RECT.h).toFixed(1);
+      this.dot.setAttribute("cx", cx); this.dot.setAttribute("cy", cy);
+      const n = S.copTrail.length;
+      this.trail.forEach((c, i) => {
+        const p = S.copTrail[n - this.trail.length + i];  // newest point → biggest circle
+        if (!p) { c.setAttribute("opacity", "0"); return; }
+        c.setAttribute("cx", (COP_RECT.x + p.x * COP_RECT.w).toFixed(1));
+        c.setAttribute("cy", (COP_RECT.y + p.y * COP_RECT.h).toFixed(1));
+        c.setAttribute("opacity", (0.45 * (i / this.trail.length)).toFixed(3));
+      });
+    },
+  };
 
   function drawGauge() {
     const w = gaugeCtx.canvas.width, h = gaugeCtx.canvas.height;
@@ -534,9 +545,8 @@
   function frame() {
     const t = now(), dt = t - lastFrame; lastFrame = t;
     if (S.sim) simTick(dt);
-    drawFoot(footL, S.sensors.left, false);
-    drawFoot(footR, S.sensors.right, true);
-    drawCop(); drawGauge(); renderLoads(); drawStepMap();
+    ShoeStage.render();
+    drawGauge(); renderLoads(); drawStepMap();
     requestAnimationFrame(frame);
   }
 
@@ -548,7 +558,7 @@
     S.sim = !S.sim;
     $("btn-sim").textContent = S.sim ? "⏸ Stop Simulation" : "▶ Simulate";
     $("btn-sim").classList.toggle("primary", !S.sim);
-    if (S.sim) { S.baselineTorso = null; S.baselinePelvisl = null; log("Simulation started — walking, then lifting boxes."); }
+    if (S.sim) { S.baselineTorso = null; S.baselinePelvis = null; log("Simulation started — walking, then lifting boxes."); }
     else log("Simulation stopped.");
   };
   $("btn-reset").onclick = () => {
@@ -556,10 +566,13 @@
       steps: 0, stepTimes: [], stepsPerSide: { left: 0, right: 0 },
       lifts: 0, liftsGood: 0, liftsBad: 0, redTotalMs: 0, redSince: null,
       copTrail: [], copHistory: [], baselineTorso: null, baselinePelvis: null, calSamples: [],
+      footprints: [], stepSeq: 0, walker: { x: 0, y: 0 }, heading: 0,
+      sensors: { left: new Array(8).fill(0), right: new Array(8).fill(0) },
     });
     renderCounters(); renderGait(); log("Session reset.");
   };
 
+  ShoeStage.init();
   log("Ready. Connect devices, or press Simulate to preview without hardware.");
   if (!SDKAdapter.hasSDK()) log("Note: SDK global not detected — connect buttons will be inert; Simulate works.", "warn");
   frame();
