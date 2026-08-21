@@ -59,6 +59,10 @@
   .shoe-frame svg { display: block; height: 380px; width: auto; max-width: 100%; }
   @media (max-width: 680px) { .shoe-frame svg { height: 300px; } }
   .shoe-fallback { color: var(--muted); font-size: .8rem; padding: 40px 20px; text-align: center; }
+  .stance-mount { position: relative; width: 100%; min-height: 360px; border-radius: 12px; overflow: hidden; background: linear-gradient(180deg, #141a44 0%, #0d1030 100%); border: 1px solid var(--line); }
+  .stance-mount canvas { display: block; }
+  .stance-fallback { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: .85rem; text-align: center; padding: 0 16px; }
+  .stance-hint { color: var(--muted); font-size: .72rem; text-align: right; margin: 4px 2px 0; }
   .loadbar { height: 14px; border-radius: 7px; background: var(--navy-2); border: 1px solid var(--line); overflow: hidden; display: flex; margin-top: 10px; }
   .loadbar .left { background: var(--teal); transition: width .12s linear; }
   .loadbar .right { background: #6f7bff; flex: 1; transition: width .12s linear; }
@@ -120,11 +124,8 @@
   <!-- Center of pressure -->
   <div class="card span7">
     <h2><span class="statusdot" id="dot-insoles"></span>Center of Pressure & Balance</h2>
-    <div class="shoe-stage">
-      <div class="shoe-frame" id="shoe-frame">
-        <div class="shoe-fallback">loading shoe artwork…</div>
-      </div>
-    </div>
+    <div id="stance3d" class="stance-mount"><div class="stance-fallback" id="stance-loading">Loading 3D stance…</div></div>
+    <p class="stance-hint">drag to orbit · scroll to zoom · each shoe shows its live heading &amp; pressure</p>
     <div class="loadbar"><div class="left" id="load-left" style="width:50%"></div><div class="right" id="load-right"></div></div>
     <div class="loadlabels"><span>L <b id="load-left-pct">50%</b></span><span>Stability <b id="stability">—</b></span><span><b id="load-right-pct">50%</b> R</span></div>
     <div class="loadlabels" style="margin-top:8px"><span>◎ per-insole COP</span><span>● individual sensors</span><span>⬤ combined COP + sway</span></div>
@@ -185,5 +186,12 @@
 
 <script src="https://unpkg.com/brilliantsole@latest/build/brilliantsole.js"></script>
 <script src="app.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.183.2/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.183.2/examples/jsm/"
+} }
+</script>
+<script type="module" src="stance3d.js"></script>
 </body>
 </html>

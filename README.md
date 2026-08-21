@@ -5,7 +5,7 @@ Live browser demo on the [Brilliant Wear JavaScript SDK](https://github.com/bril
 Built for enterprise evaluations (systems-integrator and logistics conversations).
 
 ## What it shows
-- **Center of pressure & balance** — live COP trail and per-sensor pressure over real top-down shoe artwork (the golf shoe model render with its sensor-bed flex-circuit overlay); L/R load split, stability score
+- **Center of pressure & balance** — a **3D stance** (the golf app's `RecordingStance3D`, ported to vanilla three.js: the same translucent shoe GLBs + sensor-bed art) showing each insole's **live heading / relative orientation**, per-pad pressure glow, per-foot + combined center of pressure, with the L/R load split + stability score below it
 - **Footstep map** — waltz-chart-style numbered L/R footprints with a 10-second fade, direction from IMU yaw (insole-only; no external positioning SDK)
 - **Lifting posture** — trunk flexion/lean/twist from a Sense unit on the upper back; optional second unit on the pelvis distinguishes hip-hinge (good) from stooped-back (risky) lifts
 - **Per-insole + combined center of pressure** — a COP ring on each insole plus the combined both-feet COP with a sway trail
@@ -57,9 +57,14 @@ The warehouse pipeline (used for both Simulate and replay re-derivation) lives i
 - A dormant `SDKAdapter` (verified against SDK v0.0.78) is kept as reference / re-enable point for
   live Web Bluetooth, but the app does not connect to hardware — capture is the portal's job.
 
-**Artwork**: `assets/shoes.svg` (pads id'd `pad-{left,right}-{0..7}`, centers in `PAD_POS`) is composed
-from the golf render + sensor-bed overlay (`golfShoeModel_sensorbedOverlay.svg`, in `~/Downloads`);
-regenerate with `tools/build_shoes.py` if the source artwork changes.
+**3D stance** (`stance3d.js`, ES module, three.js via import-map CDN): loads `assets/golf-shoe-{left,right}.glb`
++ `assets/sensorbed-{left,right}.png` (copied from the portal) and reads `window.WH` (the app's state) each
+frame — shoe yaw from `S.footYaw`, pads from `S.sensors`, per-foot COP from `S.copFoot`. Field constants
+(`SHOE_MODEL_FOR_SIDE`, `BED_ROTATION_Z`, `PAD_MIRROR_X`, `STANCE_TOE_SIGN`, `SHOE_MODEL_YAW`) carried over
+from the golf widget. Per-foot heading = insole `gameRotation` yaw (replay) or a synthesized flare (Simulate).
+
+**2D artwork** (`assets/shoes.svg`, `tools/build_shoes.py`) is now dormant — the `ShoeStage` code is kept
+but the 3D stance replaced it in the UI.
 
 ## Deploy (GitHub Pages)
 Push to a public repo → Settings → Pages → deploy from `main` root. The page is fully static;

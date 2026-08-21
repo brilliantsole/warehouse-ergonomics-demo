@@ -36,6 +36,7 @@
     stepsPerSide: { left: 0, right: 0 },
     cop: { x: 0.5, y: 0.5 }, copTrail: [], copHistory: [],
     copFoot: { left: { x: 0.5, y: 0.5 }, right: { x: 0.5, y: 0.5 } }, // per-insole COP
+    footYaw: { left: -10, right: 10 }, // per-insole heading (deg), relative orientation for the 3D stance
     sensors: { left: new Array(8).fill(0), right: new Array(8).fill(0) },
     redSince: null, redTotalMs: 0, lastHapticAt: 0,
     connected: { insoles: false, torso: false, pelvis: false },
@@ -431,6 +432,10 @@
       (S.sideLoad.left * (fcL.x * 0.5) + S.sideLoad.right * (0.5 + fcR.x * 0.5)) / wsum,
       (S.sideLoad.left * fcL.y + S.sideLoad.right * fcR.y) / wsum,
     );
+    // per-foot heading: natural toe-out flare + gentle dynamic sway (relative insole orientation)
+    const ty = S.simT / 1000;
+    S.footYaw.left = -11 + 4 * Math.sin(ty * 1.3) + rnd(1.5);
+    S.footYaw.right = 11 + 4 * Math.sin(ty * 1.3 + 0.6) + rnd(1.5);
     if (!S.baselineTorso) S.baselineTorso = eulerToQuat(0, 0, 0);
     if (!S.baselinePelvis) S.baselinePelvis = eulerToQuat(0, 0, 0);
     onTorsoQuat(eulerToQuat(torsoFlex, rnd(3), rnd(4)));
@@ -520,6 +525,7 @@
     ready: false, pads: { left: [], right: [] }, trail: [], dot: null, footDots: {},
     async init() {
       const frame = $("shoe-frame");
+      if (!frame) return;                 // 2D stage replaced by the 3D stance widget
       try {
         const res = await fetch("assets/shoes.svg");
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -688,6 +694,7 @@
       zone: S.flexion >= CFG.flexionRed ? "red" : S.flexion >= CFG.flexionAmber ? "amber" : "green",
       st: S.steps, li: S.lifts, lg: S.liftsGood, lb: S.liftsBad, stab: stabilityScore(),
       sl: S.sensors.left.map((v) => +v.toFixed(3)), sr: S.sensors.right.map((v) => +v.toFixed(3)),
+      fyl: +S.footYaw.left.toFixed(1), fyr: +S.footYaw.right.toFixed(1),
     };
   }
 
@@ -698,15 +705,15 @@
   function deriveFromRecording(rec) {
     const recStart = rec.timestamp ?? 0;
     const dev = Array.isArray(rec.devices) ? rec.devices : [];
-    const streams = { footL: null, footR: null, torso: null, pelvis: null };
+    const streams = { footL: null, footR: null, footLgr: null, footRgr: null, torso: null, pelvis: null };
     const senses = [];
     for (const d of dev) {
       const sd = Array.isArray(d.sensorData) ? d.sensorData : [];
       const press = sd.find((s) => s.sensorType === "pressure");
       const gr = sd.find((s) => s.sensorType === "gameRotation") || sd.find((s) => s.sensorType === "rotation");
       const type = d.type || "", place = String(d.placement || "").toLowerCase();
-      if (type === "leftInsole" || place === "left foot") streams.footL = press || streams.footL;
-      else if (type === "rightInsole" || place === "right foot") streams.footR = press || streams.footR;
+      if (type === "leftInsole" || place === "left foot") { streams.footL = press || streams.footL; streams.footLgr = gr || streams.footLgr; }
+      else if (type === "rightInsole" || place === "right foot") { streams.footR = press || streams.footR; streams.footRgr = gr || streams.footRgr; }
       else if (gr) senses.push({ gr, place });
       else if (press && !streams.footL) streams.footL = press;
       else if (press) streams.footR = press;
@@ -744,6 +751,14 @@
     resetSession();
     S.baselineTorso = streams.torso ? quatOf(at(streams.torso, 0)) : eulerToQuat(0, 0, 0);
     S.baselinePelvis = streams.pelvis ? quatOf(at(streams.pelvis, 0)) : null;
+    // per-foot heading baselines (relative insole orientation, deg): first-sample yaw
+    const gr0 = { left: streams.footLgr ? quatOf(at(streams.footLgr, 0)) : null, right: streams.footRgr ? quatOf(at(streams.footRgr, 0)) : null };
+    const footYawAt = (grStream, base, t, flare) => {
+      if (!grStream || !base) return flare; // no insole IMU → natural flare
+      const q = quatOf(at(grStream, t)); if (!q) return flare;
+      const rel = quatMul(quatConj(base), q);
+      return flare + quatToEuler(rel).yaw;
+    };
     Deriving.on = true; Deriving.footEvents = []; suppressLog = true;
     const frames = []; let lastSnap = -1000; const STEP = 50;
     for (let t = 0; t <= duration; t += STEP) {
@@ -761,6 +776,8 @@
       if (streams.torso) { const q = quatOf(at(streams.torso, t)); if (q) onTorsoQuat(q); }
       if (streams.pelvis) { const q = quatOf(at(streams.pelvis, t)); if (q) onPelvisQuat(q); }
       if (streams.torso) S.heading = S.twist;
+      S.footYaw.left = footYawAt(streams.footLgr, gr0.left, t, -11);
+      S.footYaw.right = footYawAt(streams.footRgr, gr0.right, t, 11);
       if (t - lastSnap >= 100) { lastSnap = t; frames.push(snapshotFrame(t)); }
     }
     CLOCK = null; Deriving.on = false; suppressLog = false;
@@ -811,6 +828,8 @@
     S.sideLoad.left = fr.ll; S.sideLoad.right = fr.lr;
     S.sensors.left = fr.sl.slice(); S.sensors.right = fr.sr.slice();
     S.flexion = fr.fx; S.lean = fr.ln; S.twist = fr.tw; S.pelvisFlexion = fr.pf;
+    if (fr.fyl != null) S.footYaw.left = fr.fyl;
+    if (fr.fyr != null) S.footYaw.right = fr.fyr;
     S.steps = fr.st; S.lifts = fr.li; S.liftsGood = fr.lg; S.liftsBad = fr.lb;
     S.stabilityOverride = fr.stab;
     S.copTrail = [];
@@ -878,6 +897,9 @@
   };
   $("btn-load").onclick = () => $("file-in").click();
   $("file-in").onchange = (e) => { handleFiles(e.target.files); e.target.value = ""; };
+
+  // expose read-only state for the 3D stance module (stance3d.js, ES module)
+  window.WH = { S, CFG, PAD_NORM };
 
   ShoeStage.init();
   log("Ready. Press ▶ Simulate to preview, or Load Recording to replay a portal capture synced to its video.");
