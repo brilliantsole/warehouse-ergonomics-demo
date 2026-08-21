@@ -12,12 +12,24 @@ Built for enterprise evaluations (systems-integrator and logistics conversations
 - **Haptic coaching** — insoles buzz the moment posture enters the red zone (on real captures)
 - **Session metrics** — steps, cadence, asymmetry, lift counts (good vs risky), time-in-red
 
-This is a **showcase + review** app. It has two modes and does **not** capture data itself —
+This is a **showcase + review** app. It does **not** capture data itself —
 **recording lives in the BrilliantWear portal** (Session Recording → the "Warehouse ergonomics" preset):
 
+- **☰ Recordings** (`recordings.html`) — a gallery of real captures. Each card plays the recording
+  through the dashboard (`index.html?rec=<id>`) synced to its video, and offers the raw sensor data
+  as **⬇ JSON** / **⬇ CSV**. Driven by `recordings/manifest.json`; add an entry + files to publish a take.
 - **▶ Simulate** — a full walking + good/bad-lift loop with no hardware. For quick demos.
-- **⤓ Load Recording** — open a session captured in the portal and replay the **entire dashboard
+- **⤓ Load Recording** — open any portal export locally and replay the **entire dashboard
   scrubbed in sync with its video**, the golf-demo review experience (see below).
+- **⬇ JSON / ⬇ CSV** on the dashboard export the loaded recording's raw data (JSON as-is; CSV is a
+  flattened long format, one row per sample across scalar + pressure streams).
+
+### Publishing a recording to the gallery
+1. Portal → recording → **Download JSON**; **Download MP4** from its video track.
+2. Optionally shrink the JSON to the streams the dashboard uses (orientation + pressure) — see
+   `tools/` notes; WE 4 went from 28 MB → 5.7 MB this way.
+3. Drop both into `recordings/`, add a `manifest.json` entry (`id`, `title`, `json`, `video`,
+   `syncOffsetMs` from the portal's video track, `sensors`, `note`), commit, push.
 
 ## Loading a recording
 
