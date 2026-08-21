@@ -42,9 +42,13 @@
   };
 
   const $ = (id) => document.getElementById(id);
-  const now = () => performance.now();
+  let CLOCK = null;                 // when set (offline re-derive), now() returns virtual ms
+  const now = () => (CLOCK == null ? performance.now() : CLOCK);
+  let suppressLog = false;          // silence the on-screen log during offline re-derive
+  const Deriving = { on: false, footEvents: [] };
 
   function log(msg, cls = "") {
+    if (suppressLog) return;
     const el = $("log");
     const t = new Date().toLocaleTimeString([], { hour12: false });
     el.innerHTML += `<div><span class="t">${t}</span> <span class="${cls}">${msg}</span></div>`;
@@ -196,13 +200,14 @@
     S.stepSeq++;
     S.footprints.push({ x: fx, y: fy, side, n: S.stepSeq, t, heading: S.heading });
     while (S.footprints.length && t - S.footprints[0].t > MAP.windowMs) S.footprints.shift();
+    if (Deriving.on) Deriving.footEvents.push({ t, x: fx, y: fy, side, n: S.stepSeq, heading: S.heading });
   }
 
   const mapCtx = $("stepmap").getContext("2d");
   function drawStepMap() {
     const w = mapCtx.canvas.width, h = mapCtx.canvas.height;
     mapCtx.clearRect(0, 0, w, h);
-    const t = now();
+    const t = (S.replayActive && S.clockT != null) ? S.clockT : now();
     const fresh = S.footprints.filter((p) => t - p.t <= MAP.windowMs);
     if (!fresh.length) {
       mapCtx.fillStyle = "rgba(154,163,199,.45)";
@@ -608,6 +613,7 @@
   }
 
   function renderPosture(zone) {
+    if (Deriving.on) return;
     $("flexion").textContent = `${S.flexion.toFixed(0)}°`;
     $("lean").textContent = `${S.lean.toFixed(0)}°`;
     $("twist").textContent = `${S.twist.toFixed(0)}°`;
@@ -621,6 +627,7 @@
   }
 
   function renderGait() {
+    if (Deriving.on) return;
     $("steps").textContent = S.steps;
     if (S.stepTimes.length >= 4) {
       const span = S.stepTimes[S.stepTimes.length - 1] - S.stepTimes[0];
@@ -635,6 +642,7 @@
   }
 
   function renderCounters() {
+    if (Deriving.on) return;
     $("lifts").textContent = S.lifts;
     $("lifts-good").textContent = S.liftsGood;
     $("lifts-bad").textContent = S.liftsBad;
@@ -646,14 +654,211 @@
     $("load-left").style.width = `${pct}%`;
     $("load-left-pct").textContent = `${pct.toFixed(0)}%`;
     $("load-right-pct").textContent = `${(100 - pct).toFixed(0)}%`;
-    const st = stabilityScore();
+    const st = (S.replayActive && S.stabilityOverride != null) ? S.stabilityOverride : stabilityScore();
     $("stability").textContent = st == null ? "—" : `${st}/100`;
+  }
+
+  // ---------- session (loaded recording) + replay ----------
+  // Capture happens in the BrilliantWear portal. Here we LOAD a recording it
+  // produced (raw sensor JSON + the webcam clip) and replay the whole warehouse
+  // dashboard scrubbed in sync with the video — the golf-demo review experience.
+  const Session = { frames: [], footEvents: [], video: null, durationMs: 0 };
+  const videoWrap = () => document.querySelector(".video-wrap");
+
+  function resetSession() {
+    Object.assign(S, {
+      steps: 0, stepTimes: [], stepsPerSide: { left: 0, right: 0 }, lastStepAt: { left: 0, right: 0 }, sideLoadPrev: { left: 0, right: 0 },
+      lifts: 0, liftsGood: 0, liftsBad: 0, inLift: false, liftPeak: 0, liftPeakDelta: 0,
+      redTotalMs: 0, redSince: null, copTrail: [], copHistory: [],
+      baselineTorso: null, baselinePelvis: null, calSamples: [], pelvisFlexion: null,
+      footprints: [], stepSeq: 0, walker: { x: 0, y: 0 }, heading: 0,
+      sensors: { left: new Array(8).fill(0), right: new Array(8).fill(0) },
+    });
+  }
+
+  function snapshotFrame(tms) {
+    return {
+      t: tms,
+      cop: { x: +S.cop.x.toFixed(4), y: +S.cop.y.toFixed(4) },
+      cl: { x: +S.copFoot.left.x.toFixed(4), y: +S.copFoot.left.y.toFixed(4) },
+      cr: { x: +S.copFoot.right.x.toFixed(4), y: +S.copFoot.right.y.toFixed(4) },
+      ll: +S.sideLoad.left.toFixed(4), lr: +S.sideLoad.right.toFixed(4),
+      fx: +S.flexion.toFixed(1), ln: +S.lean.toFixed(1), tw: +S.twist.toFixed(1),
+      pf: S.pelvisFlexion == null ? null : +S.pelvisFlexion.toFixed(1),
+      zone: S.flexion >= CFG.flexionRed ? "red" : S.flexion >= CFG.flexionAmber ? "amber" : "green",
+      st: S.steps, li: S.lifts, lg: S.liftsGood, lb: S.liftsBad, stab: stabilityScore(),
+      sl: S.sensors.left.map((v) => +v.toFixed(3)), sr: S.sensors.right.map((v) => +v.toFixed(3)),
+    };
+  }
+
+  const quatOf = (s) => (s && typeof s === "object" && "w" in s) ? { x: s.x, y: s.y, z: s.z, w: s.w } : null;
+
+  // Re-derive the warehouse dashboard from a portal/SDK raw recording by replaying
+  // its streams through the SAME live pipeline under a virtual clock. Returns frame count.
+  function deriveFromRecording(rec) {
+    const recStart = rec.timestamp ?? 0;
+    const dev = Array.isArray(rec.devices) ? rec.devices : [];
+    const streams = { footL: null, footR: null, torso: null, pelvis: null };
+    const senses = [];
+    for (const d of dev) {
+      const sd = Array.isArray(d.sensorData) ? d.sensorData : [];
+      const press = sd.find((s) => s.sensorType === "pressure");
+      const gr = sd.find((s) => s.sensorType === "gameRotation") || sd.find((s) => s.sensorType === "rotation");
+      const type = d.type || "", place = String(d.placement || "").toLowerCase();
+      if (type === "leftInsole" || place === "left foot") streams.footL = press || streams.footL;
+      else if (type === "rightInsole" || place === "right foot") streams.footR = press || streams.footR;
+      else if (gr) senses.push({ gr, place });
+      else if (press && !streams.footL) streams.footL = press;
+      else if (press) streams.footR = press;
+    }
+    for (const s of senses) {
+      if (/back|torso|thorax/.test(s.place) && !streams.torso) streams.torso = s.gr;
+      else if (/pelvis|sacrum|hip|waist/.test(s.place) && !streams.pelvis) streams.pelvis = s.gr;
+    }
+    const rest = senses.filter((s) => s.gr !== streams.torso && s.gr !== streams.pelvis);
+    if (!streams.torso && rest.length) streams.torso = rest.shift().gr;
+    if (!streams.pelvis && rest.length) streams.pelvis = rest.shift().gr;
+
+    const off = (s) => (s.initialTimestamp ?? recStart) - recStart;
+    const rate = (s) => s.dataRate || CFG.sensorRateMs;
+    const at = (s, t) => { if (!s || !s.data || !s.data.length) return null; let i = Math.floor((t - off(s)) / rate(s)); return s.data[Math.max(0, Math.min(s.data.length - 1, i))]; };
+    const endOf = (s) => (s && s.data && s.data.length ? off(s) + s.data.length * rate(s) : 0);
+    const duration = Math.max(endOf(streams.footL), endOf(streams.footR), endOf(streams.torso), endOf(streams.pelvis), 1000);
+
+    const ranges = (s) => {
+      if (!s || !s.data || !s.data.length) return null;
+      const n = (s.data[0] || []).length, mn = new Array(n).fill(Infinity), mx = new Array(n).fill(-Infinity);
+      for (const row of s.data) for (let i = 0; i < n; i++) { const v = +row[i] || 0; if (v < mn[i]) mn[i] = v; if (v > mx[i]) mx[i] = v; }
+      return { mn, mx };
+    };
+    const rL = ranges(streams.footL), rR = ranges(streams.footR);
+    const sensorObjs = (s, r, t) => {
+      const row = at(s, t); if (!row || !r) return null;
+      const pos = s.positions || [];
+      return row.map((raw, i) => {
+        const span = (r.mx[i] - r.mn[i]) || 1;
+        return { normalizedValue: Math.max(0, Math.min(1, ((+raw || 0) - r.mn[i]) / span)), position: pos[i] };
+      });
+    };
+
+    resetSession();
+    S.baselineTorso = streams.torso ? quatOf(at(streams.torso, 0)) : eulerToQuat(0, 0, 0);
+    S.baselinePelvis = streams.pelvis ? quatOf(at(streams.pelvis, 0)) : null;
+    Deriving.on = true; Deriving.footEvents = []; suppressLog = true;
+    const frames = []; let lastSnap = -1000; const STEP = 50;
+    for (let t = 0; t <= duration; t += STEP) {
+      CLOCK = t;
+      const sL = sensorObjs(streams.footL, rL, t), sR = sensorObjs(streams.footR, rR, t);
+      let loadL = 0.5, loadR = 0.5;
+      if (sL) { mapSensorsToPads("left", sL); loadL = sL.reduce((a, b) => a + b.normalizedValue, 0) / (sL.length || 1); }
+      if (sR) { mapSensorsToPads("right", sR); loadR = sR.reduce((a, b) => a + b.normalizedValue, 0) / (sR.length || 1); }
+      onSideLoad("left", loadL); onSideLoad("right", loadR);
+      S.sideLoad.left = loadL; S.sideLoad.right = loadR;
+      const fcL = footCopFromSensors("left"), fcR = footCopFromSensors("right");
+      onFootCop("left", fcL.x, fcL.y); onFootCop("right", fcR.x, fcR.y);
+      const wsum = Math.max(0.001, loadL + loadR);
+      onCop((loadL * (fcL.x * 0.5) + loadR * (0.5 + fcR.x * 0.5)) / wsum, (loadL * fcL.y + loadR * fcR.y) / wsum);
+      if (streams.torso) { const q = quatOf(at(streams.torso, t)); if (q) onTorsoQuat(q); }
+      if (streams.pelvis) { const q = quatOf(at(streams.pelvis, t)); if (q) onPelvisQuat(q); }
+      if (streams.torso) S.heading = S.twist;
+      if (t - lastSnap >= 100) { lastSnap = t; frames.push(snapshotFrame(t)); }
+    }
+    CLOCK = null; Deriving.on = false; suppressLog = false;
+    Session.frames = frames; Session.footEvents = Deriving.footEvents; Session.durationMs = duration;
+    return frames.length;
+  }
+
+  function enterReplay() {
+    if (!Session.frames.length) return;
+    if (S.sim) { S.sim = false; $("btn-sim").textContent = "▶ Simulate"; $("btn-sim").classList.add("primary"); }
+    S.replayActive = true;
+    const cam = $("cam"), scrub = $("scrub"), wrap = videoWrap();
+    if (Session.video) {
+      cam.srcObject = null; cam.src = Session.video.url; cam.controls = true; cam.muted = true;
+      wrap?.classList.add("has-video"); scrub.style.display = "none";
+      const drive = () => applyReplayAt(cam.currentTime * 1000 + (Session.video.syncOffsetMs || 0));
+      cam.ontimeupdate = drive; cam.onseeking = drive; cam.onseeked = drive;
+      $("video-mode").textContent = "review — play / scrub the video; the dashboard follows in sync";
+      $("video-sync").textContent = `sync offset ${Session.video.syncOffsetMs | 0}ms · ${(Session.durationMs / 1000).toFixed(1)}s`;
+      applyReplayAt(Session.video.syncOffsetMs || 0);
+    } else {
+      wrap?.classList.remove("has-video");
+      $("video-empty").textContent = "No video attached — drag the slider to scrub the recorded data.";
+      scrub.style.display = "block"; scrub.value = 0;
+      scrub.oninput = () => applyReplayAt((scrub.value / 1000) * Session.durationMs);
+      $("video-mode").textContent = "review (data only) — drag the slider to scrub";
+      $("video-sync").textContent = `${(Session.durationMs / 1000).toFixed(1)}s`;
+      applyReplayAt(0);
+    }
+  }
+  function exitReplay() {
+    if (!S.replayActive) return;
+    S.replayActive = false; S.stabilityOverride = null; S.clockT = null;
+    const cam = $("cam"), scrub = $("scrub");
+    if (cam) { cam.ontimeupdate = cam.onseeking = cam.onseeked = null; try { cam.pause(); } catch {} cam.removeAttribute("src"); cam.controls = false; cam.load?.(); }
+    if (scrub) { scrub.style.display = "none"; scrub.oninput = null; }
+    videoWrap()?.classList.remove("has-video");
+    $("video-mode").textContent = "idle"; $("video-sync").textContent = "";
+  }
+  function applyReplayAt(sessionMs) {
+    const F = Session.frames; if (!F.length) return;
+    let lo = 0, hi = F.length - 1, idx = 0;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (F[m].t <= sessionMs) { idx = m; lo = m + 1; } else hi = m - 1; }
+    const fr = F[idx];
+    S.clockT = fr.t;
+    S.cop = { x: fr.cop.x, y: fr.cop.y };
+    S.copFoot.left = { x: fr.cl.x, y: fr.cl.y }; S.copFoot.right = { x: fr.cr.x, y: fr.cr.y };
+    S.sideLoad.left = fr.ll; S.sideLoad.right = fr.lr;
+    S.sensors.left = fr.sl.slice(); S.sensors.right = fr.sr.slice();
+    S.flexion = fr.fx; S.lean = fr.ln; S.twist = fr.tw; S.pelvisFlexion = fr.pf;
+    S.steps = fr.st; S.lifts = fr.li; S.liftsGood = fr.lg; S.liftsBad = fr.lb;
+    S.stabilityOverride = fr.stab;
+    S.copTrail = [];
+    for (let i = Math.max(0, idx - CFG.copTrail + 1); i <= idx; i++) S.copTrail.push({ x: F[i].cop.x, y: F[i].cop.y });
+    S.footprints = Session.footEvents
+      .filter((e) => e.t <= fr.t && fr.t - e.t <= MAP.windowMs)
+      .map((e) => ({ x: e.x, y: e.y, side: e.side, n: e.n, t: e.t, heading: e.heading }));
+    renderPosture(fr.zone); renderCounters(); renderGait();
+  }
+
+  // ---------- recording file loader ----------
+  function handleFiles(fileList) {
+    const files = [...(fileList || [])];
+    if (!files.length) return;
+    const jsonFile = files.find((f) => /\.json$/i.test(f.name) || (f.type || "").includes("json"));
+    const videoFile = files.find((f) => (f.type || "").startsWith("video/") || /\.(webm|mp4|mov|m4v)$/i.test(f.name));
+    const proceed = (rec) => {
+      let n = Session.frames.length;
+      if (rec) { try { n = deriveFromRecording(rec); } catch (e) { log(`Couldn't read that recording: ${e.message}`, "bad"); return; } }
+      if (!n) { log("No usable sensor data in that file.", "warn"); return; }
+      if (videoFile) {
+        if (Session.video?.url) URL.revokeObjectURL(Session.video.url);
+        Session.video = { url: URL.createObjectURL(videoFile), syncOffsetMs: (rec && rec.video && rec.video.syncOffsetMs) || 0 };
+      } else if (rec) { Session.video = null; }
+      log(`Loaded recording — ${n} frames${videoFile ? ` + video (${videoFile.name})` : " (no video)"}.`);
+      enterReplay();
+    };
+    if (jsonFile) {
+      const fr = new FileReader();
+      fr.onload = () => { let rec = null; try { rec = JSON.parse(fr.result); } catch (e) { log(`Bad JSON: ${e.message}`, "bad"); return; } proceed(rec); };
+      fr.onerror = () => log("Could not read the JSON file.", "bad");
+      fr.readAsText(jsonFile);
+    } else if (videoFile && Session.frames.length) {
+      proceed(null); // attach a video to an already-loaded recording
+    } else {
+      log("Select the recording's data JSON (and optionally its video clip).", "warn");
+    }
   }
 
   // ---------- main loop ----------
   let lastFrame = now();
   function frame() {
     const t = now(), dt = t - lastFrame; lastFrame = t;
+    if (S.replayActive) {
+      ShoeStage.render(); drawGauge(); renderLoads(); drawStepMap();
+      requestAnimationFrame(frame); return;
+    }
+    S.clockT = null;
     if (S.sim) simTick(dt);
     ShoeStage.render();
     drawGauge(); renderLoads(); drawStepMap();
@@ -661,29 +866,20 @@
   }
 
   // ---------- wiring ----------
-  // Showcase build: Simulate is the only control. Live hardware capture + data
-  // recording happen in the BrilliantWear portal (Session Recording on /devices),
-  // so the Connect / Record / Save / Reset controls were intentionally removed
-  // here. The SDKAdapter hardware path below is kept as reference / re-enable point.
+  // Two ways to drive the dashboard: ▶ Simulate (no hardware), or Load Recording
+  // (replay a session captured in the BrilliantWear portal, synced to its video).
   $("btn-sim").onclick = () => {
+    if (S.replayActive) exitReplay();
     S.sim = !S.sim;
     $("btn-sim").textContent = S.sim ? "⏸ Stop Simulation" : "▶ Simulate";
     $("btn-sim").classList.toggle("primary", !S.sim);
-    if (S.sim) {
-      // fresh session each run so the showcase loops clean
-      Object.assign(S, {
-        steps: 0, stepTimes: [], stepsPerSide: { left: 0, right: 0 },
-        lifts: 0, liftsGood: 0, liftsBad: 0, redTotalMs: 0, redSince: null,
-        copTrail: [], copHistory: [], baselineTorso: null, baselinePelvis: null, calSamples: [],
-        footprints: [], stepSeq: 0, walker: { x: 0, y: 0 }, heading: 0,
-        sensors: { left: new Array(8).fill(0), right: new Array(8).fill(0) },
-      });
-      renderCounters(); renderGait();
-      log("Simulation started — walking, then lifting boxes.");
-    } else log("Simulation stopped.");
+    if (S.sim) { resetSession(); renderCounters(); renderGait(); log("Simulation started — walking, then lifting boxes."); }
+    else log("Simulation stopped.");
   };
+  $("btn-load").onclick = () => $("file-in").click();
+  $("file-in").onchange = (e) => { handleFiles(e.target.files); e.target.value = ""; };
 
   ShoeStage.init();
-  log("Ready — press ▶ Simulate to preview. Live capture runs in the BrilliantWear portal.");
+  log("Ready. Press ▶ Simulate to preview, or Load Recording to replay a portal capture synced to its video.");
   frame();
 })();

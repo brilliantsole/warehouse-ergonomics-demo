@@ -8,27 +8,35 @@ Built for enterprise evaluations (systems-integrator and logistics conversations
 - **Center of pressure & balance** — live COP trail and per-sensor pressure over real top-down shoe artwork (the golf shoe model render with its sensor-bed flex-circuit overlay); L/R load split, stability score
 - **Footstep map** — waltz-chart-style numbered L/R footprints with a 10-second fade, direction from IMU yaw (insole-only; no external positioning SDK)
 - **Lifting posture** — trunk flexion/lean/twist from a Sense unit on the upper back; optional second unit on the pelvis distinguishes hip-hinge (good) from stooped-back (risky) lifts
-- **Haptic coaching** — insoles buzz the moment posture enters the red zone
+- **Per-insole + combined center of pressure** — a COP ring on each insole plus the combined both-feet COP with a sway trail
+- **Haptic coaching** — insoles buzz the moment posture enters the red zone (on real captures)
 - **Session metrics** — steps, cadence, asymmetry, lift counts (good vs risky), time-in-red
-- **Data collection** — **● Record** a session, then **Save CSV** / **Save JSON** (see below)
 
-## Collecting data
+This is a **showcase + review** app. It has two modes and does **not** capture data itself —
+**recording lives in the BrilliantWear portal** (Session Recording → the "Warehouse ergonomics" preset):
 
-Press **● Record** to start a session, run the scenario (walk + lifts), press **■ Stop**, then export:
+- **▶ Simulate** — a full walking + good/bad-lift loop with no hardware. For quick demos.
+- **⤓ Load Recording** — open a session captured in the portal and replay the **entire dashboard
+  scrubbed in sync with its video**, the golf-demo review experience (see below).
 
-- **Save JSON** — every connected device's *raw* sensor stream (pressure raw values + sensor
-  positions, gameRotation quaternions) with timestamps and data rates, in the SDK's own recording
-  schema. Loads directly into the SDK's `examples/recording` loader/visualizer, and is the file to
-  keep for ML (e.g. Edge Impulse lift classification). *(Requires hardware — disabled in Simulate.)*
-- **Save CSV** — the ergonomics *metrics* timeline sampled at ~10 Hz: `t_ms, cop_x, cop_y,
-  load_l, load_r, flexion_deg, lean_deg, twist_deg, pelvis_flexion_deg, hinge_delta_deg, zone,
-  steps, lifts, lifts_good, lifts_bad, stability`. Opens in any spreadsheet; works in Simulate too.
+## Loading a recording
 
-Start/stop each fire a distinct insole buzz, so the wearer feels the session boundaries (and it
-doubles as a haptics check). Files download with an ISO-timestamp name; nothing leaves the browser.
+Export a session from the portal (its raw sensor **data JSON** + the **webcam video**), then
+**⤓ Load Recording** and pick both files (select them together, or the JSON then the video).
+
+The app re-derives the whole warehouse dashboard from the raw streams — per-insole & combined COP,
+individual sensor pressure, trunk flexion / hip-hinge-vs-stoop, footstep map, step & lift counts —
+and plays it back **synced to the video**: scrub or play the clip and the dashboard follows. With no
+video, a slider scrubs the data. Everything runs locally in the browser; nothing is uploaded.
+
+Accepted data JSON = the SDK/portal recording schema: `devices[].sensorData[]` with pressure
+`rawValue` arrays + sensor `positions`, and `gameRotation` (or `rotation`) quaternions, each with
+`initialTimestamp` + `dataRate`. Device role comes from `type` (`leftInsole`/`rightInsole`) and
+`placement` (`upper back` → torso, `pelvis` → pelvis); generic Sense units otherwise fall back to
+first-torso / second-pelvis. Video sync uses `video.syncOffsetMs` from the JSON if present, else 0.
 
 ## Run it
-Serve the folder and open it in Chrome/Edge (Web Bluetooth required for hardware):
+Serve the folder and open it in Chrome/Edge:
 
 ```bash
 npx serve .
@@ -37,37 +45,17 @@ npx serve .
 (Serving matters: the shoe artwork is fetched from `assets/shoes.svg`, which `file://` blocks.
 Opening `index.html` directly still works, minus the artwork.)
 
-**No hardware?** Press **▶ Simulate** — full walking + good/bad lift loop.
+## Tuning notes
 
-## Hardware setup (2–3 devices)
-1. **Insoles** (pair) — Connect Insoles → pick left, then right in the Bluetooth chooser
-2. **Torso Sense** — band mount between the shoulder blades; stand tall ~1 s after connect (auto-calibrates upright)
-3. **Pelvis Sense** *(optional but recommended)* — band at the sacrum; enables hinge-vs-stoop lift classification
+The warehouse pipeline (used for both Simulate and replay re-derivation) lives in `app.js`:
 
-## SDK notes (wired against SDK v0.0.78)
-
-All SDK touchpoints live in `SDKAdapter` inside `app.js`, verified against the v0.0.78 build and examples:
-
-- **Insoles** — `BS.DevicePair.insoles` (auto-assigns connected insoles). `new BS.Device(); device.connect()`
-  opens the chooser; call once per foot. Combined COP from the pair's `pressure` event
-  (`normalizedCenter`); per-side sensors + load from `devicePressure` (`{ pressure, side }`,
-  `pressure.sensors[i].normalizedValue` / `.position`, `pressure.normalizedSum`).
-- **Sense** (torso/pelvis) — `new BS.Device(); device.connect()`, then the `gameRotation` event
-  (`{ gameRotation: quaternion, gameRotationEuler }`). Trunk angles are computed relative to the
-  upright quaternion captured in the first ~1 s.
-- **Vibration** — `devicePair.triggerVibration([{ type:"waveformEffect", segments:[{ effect }] }])`,
-  effects from `BS.VibrationWaveformEffects`.
-- **Recording** — `BS.DeviceManager` `deviceConnected` → per-device `sensorData` events, stored in the
-  SDK recording schema (see `examples/recording`).
-
-Thresholds (flexion zones, step detection, stride) are in `CFG`/`MAP` at the top.
-
-### Two things to eyeball on first hardware run
-1. **COP orientation** — `COP_FLIP_X` / `COP_FLIP_Y` near `COP_RECT`. If the live dot reads mirrored
-   front↔back or left↔right vs. the wearer, flip the offending constant (one line). Defaults are a best guess.
-2. **Sensor→pad order** — `SDK_SENSOR_TO_PAD` (identity) maps an 8-sensor insole to the artwork pads
-   (anatomical, 0 heel → 7 hallux). Insoles reporting a different count (e.g. 16-sensor beds) are placed
-   automatically by each sensor's `position`. If an 8-sensor insole lights the wrong pads, reorder this array.
+- Thresholds (flexion zones, step detection, stride) are in `CFG`/`MAP` at the top.
+- **COP orientation** — `COP_FLIP_X` / `COP_FLIP_Y` near `COP_RECT`. If a replayed COP reads mirrored
+  front↔back or left↔right vs. the wearer, flip the offending constant (one line).
+- **Sensor→pad order** — `SDK_SENSOR_TO_PAD` maps an 8-sensor insole to the artwork pads (anatomical,
+  0 heel → 7 hallux); other counts (e.g. 16-sensor beds) are placed by each sensor's `position`.
+- A dormant `SDKAdapter` (verified against SDK v0.0.78) is kept as reference / re-enable point for
+  live Web Bluetooth, but the app does not connect to hardware — capture is the portal's job.
 
 **Artwork**: `assets/shoes.svg` (pads id'd `pad-{left,right}-{0..7}`, centers in `PAD_POS`) is composed
 from the golf render + sensor-bed overlay (`golfShoeModel_sensorbedOverlay.svg`, in `~/Downloads`);

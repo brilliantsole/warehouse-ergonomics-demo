@@ -82,6 +82,12 @@
   .footer-note { margin-top: 16px; color: var(--muted); font-size: .75rem; }
   .toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: .82rem; cursor: pointer; user-select: none; }
   .toggle input { accent-color: var(--teal); width: 16px; height: 16px; }
+  .video-row { display: flex; justify-content: center; }
+  .video-wrap { position: relative; width: 100%; max-width: 760px; border-radius: 10px; overflow: hidden; background: #05070f; border: 1px solid var(--line); aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center; }
+  .video-wrap video.cam { width: 100%; height: 100%; object-fit: contain; display: none; background: #05070f; }
+  .video-wrap.has-video video.cam { display: block; }
+  .video-empty { color: var(--muted); font-size: .8rem; text-align: center; padding: 18px 22px; line-height: 1.5; }
+  .video-wrap.has-video .video-empty { display: none; }
 </style>
 </head>
 <body>
@@ -92,10 +98,25 @@
   </div>
   <div class="controls">
     <button id="btn-sim" class="primary">▶ Simulate</button>
+    <button id="btn-load">⤓ Load Recording</button>
+    <input id="file-in" type="file" multiple accept=".json,application/json,video/*" hidden />
   </div>
 </header>
 
 <div class="grid">
+  <!-- Loaded recording, synced (headline) -->
+  <div class="card span12" id="video-card">
+    <h2><span class="statusdot" id="dot-cam"></span>Recording — synced playback</h2>
+    <div class="video-row">
+      <div class="video-wrap">
+        <video id="cam" class="cam" muted playsinline></video>
+        <div class="video-empty" id="video-empty">Load a recording (data JSON + video) exported from the portal — it replays here, scrubbing the whole dashboard in sync with the video.</div>
+      </div>
+    </div>
+    <input id="scrub" type="range" min="0" max="1000" value="0" style="width:100%;display:none;margin-top:10px;accent-color:var(--teal)" />
+    <div class="loadlabels" style="margin-top:8px"><span id="video-mode">idle</span><span class="k" id="video-sync"></span></div>
+  </div>
+
   <!-- Center of pressure -->
   <div class="card span7">
     <h2><span class="statusdot" id="dot-insoles"></span>Center of Pressure & Balance</h2>
