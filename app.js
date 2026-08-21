@@ -830,20 +830,23 @@
   // auto-range needed. gameRotation (when the recording has it) comes from scalar rows.
   function deriveFromPortalExport(exp) {
     const devs = exp.recording?.devices || [];
-    const roleOf = (placement, side) => {
-      const p = String(placement || "").toLowerCase();
-      if (p === "left foot") return "footL";
-      if (p === "right foot") return "footR";
-      if (/back|torso|thorax/.test(p)) return "torso";
-      if (/pelvis|sacrum|hip|waist/.test(p)) return "pelvis";
-      return null;
-    };
-    const role = {}; // device_id → role (first assignment wins on duplicate placements)
+    // Two-pass role assignment. Trunk/pelvis come from placement; FEET are split by
+    // the device SIDE, not the placement label — placement labels can be stale or
+    // duplicated (observed: the right insole still tagged "left foot"), whereas the
+    // side is set on the device itself. First assignment of each role wins.
+    const role = {};
+    const take = (id, r) => { if (r && !Object.values(role).includes(r)) role[id] = r; };
     for (const d of devs) {
-      let r = roleOf(d.placement, d.deviceSide);
-      if (!r && d.deviceType === "insole") r = d.deviceSide === "right" ? "footR" : "footL";
-      if (r && !Object.values(role).includes(r)) role[d.deviceId] = r;
-      else if (r) role[d.deviceId] = r + "_dup"; // keep but don't map (jumbled recording)
+      const p = String(d.placement || "").toLowerCase();
+      if (/back|torso|thorax/.test(p)) take(d.deviceId, "torso");
+      else if (/pelvis|sacrum|hip|waist/.test(p)) take(d.deviceId, "pelvis");
+    }
+    for (const d of devs) {
+      if (role[d.deviceId]) continue;
+      const p = String(d.placement || "").toLowerCase();
+      const s = String(d.deviceSide || "").toLowerCase();
+      if (!(p.includes("foot") || d.deviceType === "insole")) continue;
+      take(d.deviceId, s === "right" ? "footR" : s === "left" ? "footL" : (p === "right foot" ? "footR" : p === "left foot" ? "footL" : null));
     }
     const idFor = (want) => Object.keys(role).find((id) => role[id] === want);
     const ids = { footL: idFor("footL"), footR: idFor("footR"), torso: idFor("torso"), pelvis: idFor("pelvis") };
