@@ -940,6 +940,16 @@
       $("video-mode").textContent = "review — play / scrub the video; the dashboard follows in sync";
       $("video-sync").textContent = `sync offset ${Session.video.syncOffsetMs | 0}ms · ${(Session.durationMs / 1000).toFixed(1)}s`;
       applyReplayAt(Session.video.syncOffsetMs || 0);
+      // Webcam clips often open on a near-black frame (exposure still settling), which
+      // reads as "no video". Park the playhead on the first bright frame instead.
+      const parkOnBrightFrame = () => {
+        const c = document.createElement("canvas"); c.width = 32; c.height = 18;
+        const ctx = c.getContext("2d");
+        const lum = () => { try { ctx.drawImage(cam, 0, 0, 32, 18); const d = ctx.getImageData(0, 0, 32, 18).data; let s = 0; for (let i = 0; i < d.length; i += 4) s += d[i] + d[i + 1] + d[i + 2]; return s / (d.length / 4) / 3; } catch { return 255; } };
+        const tryAt = (t) => { if (t > 3) return; cam.onseeked = () => { cam.onseeked = drive; if (lum() < 12) tryAt(t + 0.5); else drive(); }; cam.currentTime = t; };
+        if (lum() < 12) tryAt(0.5);
+      };
+      if (cam.readyState >= 2) parkOnBrightFrame(); else cam.addEventListener("loadeddata", parkOnBrightFrame, { once: true });
     } else {
       wrap?.classList.remove("has-video");
       $("video-empty").textContent = "No video attached — drag the slider to scrub the recorded data.";
