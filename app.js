@@ -37,6 +37,10 @@
     cop: { x: 0.5, y: 0.5 }, copTrail: [], copHistory: [],
     copFoot: { left: { x: 0.5, y: 0.5 }, right: { x: 0.5, y: 0.5 } }, // per-insole COP
     footYaw: { left: -10, right: 10 }, // per-insole heading (deg), relative orientation for the 3D stance
+    // vision-derived foot POSITION (from Pose + Depth Anything over the recorded clip):
+    // x = lateral (m, + = right), z = forward (m, + = away from camera), y = lift (m), c = confidence 0..1
+    footPos: { left: { x: -0.15, y: 0, z: 0, c: 0 }, right: { x: 0.15, y: 0, z: 0, c: 0 } },
+    useVision: false, // toggle: drive foot POSITION from the vision foot-track vs. fixed stance + estimated stride
     sensors: { left: new Array(8).fill(0), right: new Array(8).fill(0) },
     redSince: null, redTotalMs: 0, lastHapticAt: 0,
     connected: { insoles: false, torso: false, pelvis: false },
@@ -201,7 +205,15 @@
     S.stepSeq++;
     S.footprints.push({ x: fx, y: fy, side, n: S.stepSeq, t, heading: S.heading });
     while (S.footprints.length && t - S.footprints[0].t > MAP.windowMs) S.footprints.shift();
-    if (Deriving.on) Deriving.footEvents.push({ t, x: fx, y: fy, side, n: S.stepSeq, heading: S.heading });
+    if (Deriving.on) {
+      const ev = { t, x: fx, y: fy, side, n: S.stepSeq, heading: S.heading, hasVis: false };
+      // bake the real landing position from the vision foot-track (when present) so the
+      // footstep map can show measured step length / sway; est coords are the fallback.
+      const ftf = sampleFootTrack(t);
+      const p = ftf && ftf[side === "left" ? "l" : "r"];
+      if (p && p.c > 0) { ev.xVis = p.x; ev.yVis = -(p.z || 0); ev.hasVis = true; }
+      Deriving.footEvents.push(ev);
+    }
   }
 
   const mapCtx = $("stepmap").getContext("2d");
@@ -668,8 +680,35 @@
   // Capture happens in the BrilliantWear portal. Here we LOAD a recording it
   // produced (raw sensor JSON + the webcam clip) and replay the whole warehouse
   // dashboard scrubbed in sync with the video — the golf-demo review experience.
-  const Session = { frames: [], footEvents: [], video: null, durationMs: 0 };
+  const Session = { frames: [], footEvents: [], video: null, durationMs: 0, footTrack: null };
   const videoWrap = () => document.querySelector(".video-wrap");
+  let lastReplayMs = 0; // remembered so the vision toggle can re-plot the current moment
+
+  // Sample the loaded vision foot-track at a recording-clock time. Track frame t
+  // is video-relative; align via the track's syncOffsetMs. Returns {left,right}
+  // {x,y,z,c} or null. Confidence 0 (or missing foot) means "fall back to insoles".
+  function sampleFootTrack(sessionMs) {
+    const ft = Session.footTrack;
+    if (!ft || !ft.frames || !ft.frames.length) return null;
+    const vt = sessionMs - (ft.video?.syncOffsetMs || 0);
+    const F = ft.frames;
+    let lo = 0, hi = F.length - 1, idx = 0;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (F[m].t <= vt) { idx = m; lo = m + 1; } else hi = m - 1; }
+    return F[idx];
+  }
+  function applyFootPos(fr) {
+    const put = (side, p) => { S.footPos[side] = p && p.c > 0 ? { x: p.x, y: p.y || 0, z: p.z || 0, c: p.c } : { ...S.footPos[side], c: 0 }; };
+    put("left", fr && fr.l); put("right", fr && fr.r);
+  }
+  function setVisionAvailable(avail) {
+    const t = $("vision-toggle");
+    if (!t) return;
+    t.disabled = !avail;
+    t.checked = avail;               // default ON when a foot-track loads
+    S.useVision = avail;
+    const hint = $("vision-hint");
+    if (hint) hint.textContent = avail ? "vision foot-track loaded" : "";
+  }
 
   function resetSession() {
     Object.assign(S, {
@@ -819,10 +858,12 @@
   }
   function applyReplayAt(sessionMs) {
     const F = Session.frames; if (!F.length) return;
+    lastReplayMs = sessionMs;
     let lo = 0, hi = F.length - 1, idx = 0;
     while (lo <= hi) { const m = (lo + hi) >> 1; if (F[m].t <= sessionMs) { idx = m; lo = m + 1; } else hi = m - 1; }
     const fr = F[idx];
     S.clockT = fr.t;
+    applyFootPos(sampleFootTrack(sessionMs)); // vision foot positions for the 3D stance
     S.cop = { x: fr.cop.x, y: fr.cop.y };
     S.copFoot.left = { x: fr.cl.x, y: fr.cl.y }; S.copFoot.right = { x: fr.cr.x, y: fr.cr.y };
     S.sideLoad.left = fr.ll; S.sideLoad.right = fr.lr;
@@ -834,39 +875,55 @@
     S.stabilityOverride = fr.stab;
     S.copTrail = [];
     for (let i = Math.max(0, idx - CFG.copTrail + 1); i <= idx; i++) S.copTrail.push({ x: F[i].cop.x, y: F[i].cop.y });
+    const vis = S.useVision;
     S.footprints = Session.footEvents
       .filter((e) => e.t <= fr.t && fr.t - e.t <= MAP.windowMs)
-      .map((e) => ({ x: e.x, y: e.y, side: e.side, n: e.n, t: e.t, heading: e.heading }));
+      .map((e) => {
+        const useV = vis && e.hasVis;
+        return { x: useV ? e.xVis : e.x, y: useV ? e.yVis : e.y, side: e.side, n: e.n, t: e.t, heading: e.heading };
+      });
     renderPosture(fr.zone); renderCounters(); renderGait();
   }
 
   // ---------- recording file loader ----------
-  function handleFiles(fileList) {
+  const readJSON = (file) => new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => { try { res(JSON.parse(fr.result)); } catch (e) { rej(e); } };
+    fr.onerror = () => rej(new Error("read error"));
+    fr.readAsText(file);
+  });
+  const isFootTrack = (obj, name) => (obj && (obj.schema === "foot-track/v1" || Array.isArray(obj.frames) && obj.frames[0] && ("l" in obj.frames[0] || "r" in obj.frames[0]))) || /foot-?track/i.test(name || "");
+
+  async function handleFiles(fileList) {
     const files = [...(fileList || [])];
     if (!files.length) return;
-    const jsonFile = files.find((f) => /\.json$/i.test(f.name) || (f.type || "").includes("json"));
+    const jsonFiles = files.filter((f) => /\.json$/i.test(f.name) || (f.type || "").includes("json"));
     const videoFile = files.find((f) => (f.type || "").startsWith("video/") || /\.(webm|mp4|mov|m4v)$/i.test(f.name));
-    const proceed = (rec) => {
-      let n = Session.frames.length;
-      if (rec) { try { n = deriveFromRecording(rec); } catch (e) { log(`Couldn't read that recording: ${e.message}`, "bad"); return; } }
-      if (!n) { log("No usable sensor data in that file.", "warn"); return; }
-      if (videoFile) {
-        if (Session.video?.url) URL.revokeObjectURL(Session.video.url);
-        Session.video = { url: URL.createObjectURL(videoFile), syncOffsetMs: (rec && rec.video && rec.video.syncOffsetMs) || 0 };
-      } else if (rec) { Session.video = null; }
-      log(`Loaded recording — ${n} frames${videoFile ? ` + video (${videoFile.name})` : " (no video)"}.`);
-      enterReplay();
-    };
-    if (jsonFile) {
-      const fr = new FileReader();
-      fr.onload = () => { let rec = null; try { rec = JSON.parse(fr.result); } catch (e) { log(`Bad JSON: ${e.message}`, "bad"); return; } proceed(rec); };
-      fr.onerror = () => log("Could not read the JSON file.", "bad");
-      fr.readAsText(jsonFile);
-    } else if (videoFile && Session.frames.length) {
-      proceed(null); // attach a video to an already-loaded recording
-    } else {
-      log("Select the recording's data JSON (and optionally its video clip).", "warn");
+
+    // Classify the JSON file(s): one recording + optional foot-track.
+    let rec = null, track = null;
+    for (const jf of jsonFiles) {
+      let obj; try { obj = await readJSON(jf); } catch (e) { log(`Bad JSON (${jf.name}): ${e.message}`, "bad"); return; }
+      if (isFootTrack(obj, jf.name)) track = obj;
+      else { rec = obj; if (!track && obj.footTrack) track = obj.footTrack; } // recording may embed a foot-track
     }
+
+    if (!rec && !Session.frames.length && !track) { log("Select the recording's data JSON (and optionally its video + foot-track).", "warn"); return; }
+
+    if (track) Session.footTrack = track; // set BEFORE derive so footstep events can bake vision positions
+    let n = Session.frames.length;
+    if (rec) { try { n = deriveFromRecording(rec); } catch (e) { log(`Couldn't read that recording: ${e.message}`, "bad"); return; } }
+    if (!n) { log("No usable sensor data in that file.", "warn"); return; }
+
+    if (videoFile) {
+      if (Session.video?.url) URL.revokeObjectURL(Session.video.url);
+      Session.video = { url: URL.createObjectURL(videoFile), syncOffsetMs: (rec && rec.video && rec.video.syncOffsetMs) || (track && track.video && track.video.syncOffsetMs) || 0 };
+    } else if (rec) { Session.video = null; }
+
+    const tf = Session.footTrack ? ` + foot-track (${Session.footTrack.frames.length} frames)` : "";
+    log(`Loaded recording — ${n} frames${videoFile ? ` + video (${videoFile.name})` : ""}${tf}.`);
+    setVisionAvailable(!!Session.footTrack);
+    enterReplay();
   }
 
   // ---------- main loop ----------
@@ -897,6 +954,11 @@
   };
   $("btn-load").onclick = () => $("file-in").click();
   $("file-in").onchange = (e) => { handleFiles(e.target.files); e.target.value = ""; };
+  $("vision-toggle").onchange = (e) => {
+    S.useVision = e.target.checked;
+    log(`Foot positions: ${S.useVision ? "vision (Pose + Depth)" : "insole estimate"}.`);
+    if (S.replayActive) applyReplayAt(lastReplayMs); // re-plot the footstep map with the chosen source
+  };
 
   // expose read-only state for the 3D stance module (stance3d.js, ES module)
   window.WH = { S, CFG, PAD_NORM };

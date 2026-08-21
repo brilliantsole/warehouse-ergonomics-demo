@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Foot-Track Extractor — Brilliant Wear Warehouse Demo</title>
+<style>
+  :root { --navy:#12163a; --panel:#21265c; --teal:#00d4aa; --text:#eef1ff; --muted:#9aa3c7; --line:#343b7a; }
+  * { box-sizing: border-box; }
+  body { font-family:-apple-system,"SF Pro Text",Inter,system-ui,sans-serif; background:var(--navy); color:var(--text); margin:0; padding:24px; line-height:1.5; }
+  h1 { font-size:1.1rem; letter-spacing:.06em; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; max-width:820px; margin-bottom:16px; }
+  label { display:block; margin:8px 0; font-size:.9rem; }
+  button { background:var(--teal); color:#06251d; border:0; border-radius:8px; padding:9px 16px; font-weight:650; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  input[type=number], input[type=text] { background:var(--navy); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 8px; width:90px; }
+  video, canvas { max-width:100%; border-radius:8px; border:1px solid var(--line); background:#05070f; }
+  #stage { display:flex; gap:12px; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:.82rem; }
+  progress { width:100%; height:14px; }
+  code { background:var(--navy); padding:1px 5px; border-radius:4px; }
+  a { color:var(--teal); }
+</style>
+</head>
+<body>
+  <h1>Foot-Track Extractor</h1>
+  <p class="muted">
+    Extracts a per-foot position track from a recorded clip — MediaPipe <b>Pose</b> in the browser (X lateral, Y lift),
+    plus optional <b>Depth Anything V3</b> for Z (front/back). Output is a <code>*.foottrack.json</code> you load into the
+    warehouse demo alongside the recording + video: it drives the 3D stance and real step length / sway on the footstep map.
+  </p>
+
+  <div class="card">
+    <label>1. Recording clip (the portal's webcam video): <input type="file" id="video-file" accept="video/*" /></label>
+    <label>2. Depth (optional): <input type="checkbox" id="use-depth" /> use Depth Anything server at
+      <input type="text" id="depth-url" value="ws://localhost:8765" style="width:180px" />
+      <span class="muted" id="depth-status">— off (Pose-only Z)</span>
+    </label>
+    <label>Sample rate:
+      <input type="number" id="fps" value="15" min="2" max="30" step="1" /> fps
+      &nbsp; Lateral scale <input type="number" id="wscale" value="1.6" min="0.2" max="4" step="0.1" /> m
+      &nbsp; Height scale <input type="number" id="hscale" value="1.7" min="0.5" max="3" step="0.1" /> m
+      &nbsp; Depth scale <input type="number" id="zscale" value="1.0" min="0.1" max="5" step="0.1" /> m
+    </label>
+    <button id="run" disabled>Extract foot-track</button>
+    <button id="save" disabled>Download foot-track JSON</button>
+    <progress id="prog" value="0" max="1"></progress>
+    <div class="muted" id="status">Load a clip to begin.</div>
+  </div>
+
+  <div class="card" id="stage">
+    <div><div class="muted">clip</div><video id="video" width="360" playsinline muted></video></div>
+    <div><div class="muted">pose + feet</div><canvas id="overlay" width="360" height="270"></canvas></div>
+  </div>
+
+  <p class="muted">
+    Notes: X/Y come from Pose (hip-relative, so camera pan doesn't shift both feet); the ground baseline is the lowest ankle
+    across the clip. Z is Pose world-depth unless the Depth Anything server is on. Depth Anything returns a colormapped depth
+    JPEG + <code>closestDepth</code>; per-foot Z here samples that map's luminance as a <i>relative</i> proxy — for metric Z,
+    extend the server to return raw depth at requested points, and add a floor calibration. Occluded feet drop to confidence 0
+    (the demo falls back to the insole estimate).
+  </p>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const videoFileInput = $("video-file"), runBtn = $("run"), saveBtn = $("save");
+const video = $("video"), overlay = $("overlay"), octx = overlay.getContext("2d");
+let poseLandmarker = null, depthWs = null, track = null;
+
+// ---- optional Depth Anything V3 server (mirrors examples/depth-anything-v3) ----
+let depthCanvas = document.createElement("canvas");
+let depthReady = false, depthPending = null;
+function connectDepth() {
+  const url = $("depth-url").value.trim();
+  try { depthWs = new WebSocket(url); depthWs.binaryType = "arraybuffer"; } catch { $("depth-status").textContent = "— bad URL"; return; }
+  depthWs.onopen = () => { $("depth-status").textContent = "— connected"; };
+  depthWs.onclose = () => { $("depth-status").textContent = "— disconnected"; depthReady = false; };
+  depthWs.onerror = () => { $("depth-status").textContent = "— error (is the server running?)"; };
+  depthWs.onmessage = async (e) => {
+    const view = new DataView(e.data);
+    const size = view.getUint32(4, true);
+    const blob = new Blob([new Uint8Array(e.data, 8, size)], { type: "image/jpeg" });
+    const bmp = await createImageBitmap(blob);
+    depthCanvas.width = bmp.width; depthCanvas.height = bmp.height;
+    depthCanvas.getContext("2d").drawImage(bmp, 0, 0); bmp.close();
+    depthReady = true;
+    if (depthPending) { const p = depthPending; depthPending = null; p(); }
+  };
+}
+$("use-depth").addEventListener("change", (e) => { if (e.target.checked) connectDepth(); else { depthWs?.close(); depthWs = null; $("depth-status").textContent = "— off (Pose-only Z)"; } });
+
+function requestDepth(bitmapSource) {
+  return new Promise((resolve) => {
+    if (!depthWs || depthWs.readyState !== 1) return resolve(null);
+    depthReady = false; depthPending = resolve;
+    const c = document.createElement("canvas"); c.width = video.videoWidth; c.height = video.videoHeight;
+    c.getContext("2d").drawImage(bitmapSource, 0, 0, c.width, c.height);
+    c.toBlob((b) => b.arrayBuffer().then((ab) => depthWs.send(ab)), "image/jpeg", 0.7);
+    setTimeout(() => { if (depthPending) { depthPending = null; resolve(null); } }, 1500); // don't hang on a slow frame
+  });
+}
+// Sample the (colormapped) depth map at a normalized point → relative 0..1 (near→far). Proxy; see notes.
+function depthAt(nx, ny) {
+  if (!depthReady || !depthCanvas.width) return null;
+  const x = Math.max(0, Math.min(depthCanvas.width - 1, Math.round(nx * depthCanvas.width)));
+  const y = Math.max(0, Math.min(depthCanvas.height - 1, Math.round(ny * depthCanvas.height)));
+  const d = depthCanvas.getContext("2d").getImageData(x, y, 1, 1).data;
+  return (0.299 * d[0] + 0.587 * d[1] + 0.114 * d[2]) / 255;
+}
+
+// ---- MediaPipe Pose (lazy import so the page opens offline) ----
+async function ensurePose() {
+  if (poseLandmarker) return;
+  $("status").textContent = "Loading MediaPipe Pose…";
+  const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+  const fileset = await vision.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  poseLandmarker = await vision.PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task" },
+    runningMode: "VIDEO", numPoses: 1,
+  });
+}
+
+videoFileInput.addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  video.src = URL.createObjectURL(f);
+  video.onloadedmetadata = () => { overlay.width = 360; overlay.height = 360 * (video.videoHeight / video.videoWidth); runBtn.disabled = false; $("status").textContent = `Clip: ${video.videoWidth}×${video.videoHeight}, ${video.duration.toFixed(1)}s. Ready to extract.`; };
+});
+
+const seek = (t) => new Promise((res) => { video.onseeked = () => res(); video.currentTime = t; });
+
+runBtn.addEventListener("click", async () => {
+  runBtn.disabled = true; saveBtn.disabled = true;
+  try { await ensurePose(); } catch (err) { $("status").textContent = "MediaPipe failed to load (network?): " + err.message; runBtn.disabled = false; return; }
+  const fps = Math.max(2, +$("fps").value || 15), dt = 1 / fps;
+  const WS = +$("wscale").value || 1.6, HS = +$("hscale").value || 1.7, ZS = +$("zscale").value || 1.0;
+  const dur = video.duration;
+  const raw = []; // {t, l, r} normalized+depth, pre-baseline
+  // MediaPipe foot landmarks: 27/28 ankle, 29/30 heel, 31/32 foot-index; 23/24 hips.
+  for (let t = 0; t <= dur; t += dt) {
+    await seek(t);
+    const res = poseLandmarker.detectForVideo(video, Math.round(t * 1000));
+    octx.drawImage(video, 0, 0, overlay.width, overlay.height);
+    let l = null, r = null;
+    if (res.landmarks && res.landmarks[0]) {
+      const lm = res.landmarks[0];
+      const hipX = (lm[23].x + lm[24].x) / 2;
+      let depthMap = null;
+      if (depthWs && depthWs.readyState === 1) { await requestDepth(video); depthMap = depthReady; }
+      const foot = (ank, heel, toe) => {
+        const a = lm[ank]; if (!a) return null;
+        const nx = (a.x + heel.x) ? a.x : a.x; // ankle as ground point
+        const vis = a.visibility ?? 0.5;
+        const zProxy = depthMap ? depthAt(a.x, a.y) : null;
+        return { xn: a.x - hipX, yn: a.y, z: zProxy, vis };
+      };
+      l = foot(27, lm[29], lm[31]);
+      r = foot(28, lm[30], lm[32]);
+      // draw
+      octx.fillStyle = "#00d4aa"; [27, 29, 31].forEach((i) => dot(lm[i]));
+      octx.fillStyle = "#6f7bff"; [28, 30, 32].forEach((i) => dot(lm[i]));
+    }
+    raw.push({ t: Math.round(t * 1000), l, r });
+    $("prog").value = t / dur; $("status").textContent = `Extracting… ${(t).toFixed(1)}/${dur.toFixed(1)}s`;
+  }
+  // ground baseline = lowest ankle (max normalized y) across the clip → lift 0
+  let groundY = 0; for (const f of raw) for (const s of [f.l, f.r]) if (s && s.yn > groundY) groundY = s.yn;
+  const conv = (s) => s ? { x: +(s.xn * WS).toFixed(3), y: +(Math.max(0, groundY - s.yn) * HS).toFixed(3), z: +(((s.z != null ? s.z : 0) - 0.5) * 2 * ZS).toFixed(3), c: +Math.max(0, Math.min(1, s.vis)).toFixed(2) } : { x: 0, y: 0, z: 0, c: 0 };
+  track = { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose" + (depthWs ? "+depth-anything-v3" : ""), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r) })) };
+  $("status").textContent = `Done — ${track.frames.length} frames. Download and load it into the demo (syncOffsetMs defaults to 0 — set it if the video started after the sensors).`;
+  saveBtn.disabled = false; runBtn.disabled = false;
+});
+
+function dot(p) { if (!p) return; octx.beginPath(); octx.arc(p.x * overlay.width, p.y * overlay.height, 4, 0, 7); octx.fill(); }
+
+saveBtn.addEventListener("click", () => {
+  if (!track) return;
+  const blob = new Blob([JSON.stringify(track)], { type: "application/json" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = `session-${Date.now()}.foottrack.json`; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+</script>
+</body>
+</html>

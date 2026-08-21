@@ -35,6 +35,29 @@ Accepted data JSON = the SDK/portal recording schema: `devices[].sensorData[]` w
 `placement` (`upper back` → torso, `pelvis` → pelvis); generic Sense units otherwise fall back to
 first-torso / second-pelvis. Video sync uses `video.syncOffsetMs` from the JSON if present, else 0.
 
+## Vision foot positions (experimental)
+
+By default the two shoes sit at a **fixed** stance and the footstep map uses an **estimated** stride.
+Load a **foot-track** alongside the recording and toggle **Vision foot positions** to drive real
+relative foot placement instead — feet closer/wider, one forward/back (Z), lift height (Y) — in both
+the 3D stance and the footstep map (real step length / sway). Insoles still provide orientation,
+pressure, COP, and step *timing*; vision provides *where* each foot is. Any low-confidence / occluded
+frame falls back to the insole estimate.
+
+Make a foot-track with **`tools/foot-track-extractor.html`**: open it, load the clip, and it runs
+MediaPipe **Pose** in the browser (X lateral, Y lift) — optionally sampling the **Depth Anything V3**
+server (`ws://localhost:8765`, from the SDK's `examples/depth-anything-v3`) for Z — and downloads a
+`*.foottrack.json`. Load that file together with the recording + video.
+
+Foot-track schema (`foot-track/v1`): `{ fps, video:{syncOffsetMs}, frames:[{ t, l:{x,y,z,c}, r:{x,y,z,c} }] }`
+— x lateral (m, +right), z forward (m, +away), y lift (m), c confidence 0–1; `t` is video-relative ms.
+`POS_SCALE` in `stance3d.js` maps metres → scene units.
+
+**Caveats (prototype):** monocular depth is relative not metric and weakest on Z; a floor calibration
+(homography) would make the top-down map metric; the extractor's per-foot depth samples the server's
+colormapped JPEG as a proxy — extend the server to return raw depth for accuracy. See the extractor
+page's own notes.
+
 ## Run it
 Serve the folder and open it in Chrome/Edge:
 

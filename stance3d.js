@@ -21,6 +21,7 @@ const BED_ROTATION_Z = { left: Math.PI, right: Math.PI };
 const PAD_MIRROR_X = { left: 1, right: -1 };
 const SHOE_MODEL_YAW = Math.PI;
 const PAD_RADIUS = 0.7, TRAIL_POINTS = 16;
+const POS_SCALE = 70; // vision foot-track metres → scene units (tune to shoe scale)
 const COP_COLOR = 0xf59e0b, COMBINED_COP_COLOR = 0x22d3ee;
 const PAD_COLOR = new THREE.Color(0x2ab5a0), PAD_HOT = new THREE.Color(0xf43f5e);
 
@@ -138,6 +139,7 @@ async function boot() {
     const fr = feet[side];
     fr.group.quaternion.copy(fr.restQuat);
     fr.basePos.set(side === "left" ? -centerDist / 2 : centerDist / 2, 0, 0);
+    fr.defaultPos = fr.basePos.clone(); // fixed stance, used when vision positions are off/absent
     fr.group.position.copy(fr.basePos);
   }
 
@@ -169,10 +171,19 @@ async function boot() {
       const yaw = ((S.footYaw && S.footYaw[side]) || 0) * Math.PI / 180;
       _q.setFromAxisAngle(_yUp, yaw);
       fr.group.quaternion.copy(_q).multiply(fr.restQuat);
-      // ground-clamp so a yawed shoe stays on the grid
+      // position: vision foot-track (real relative placement) when on & confident, else fixed stance
+      const fp = S.footPos && S.footPos[side];
+      let liftY = 0;
+      if (S.useVision && fp && fp.c > 0.15) {
+        fr.basePos.set(fp.x * POS_SCALE, 0, -fp.z * POS_SCALE);
+        liftY = Math.max(0, fp.y * POS_SCALE);
+      } else {
+        fr.basePos.copy(fr.defaultPos);
+      }
+      // ground-clamp so a yawed shoe stays on the grid (plus any vision lift)
       let minY = Infinity;
       for (const cor of fr.corners) { _v.copy(cor).applyQuaternion(fr.group.quaternion); if (_v.y < minY) minY = _v.y; }
-      fr.group.position.copy(fr.basePos); fr.group.position.y = Number.isFinite(minY) ? -minY : 0;
+      fr.group.position.copy(fr.basePos); fr.group.position.y = (Number.isFinite(minY) ? -minY : 0) + liftY;
       // pads
       const vals = S.sensors[side];
       for (let k = 0; k < fr.pads.length; k++) {

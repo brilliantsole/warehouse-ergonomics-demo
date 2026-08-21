@@ -125,8 +125,11 @@
   <div class="card span7">
     <h2><span class="statusdot" id="dot-insoles"></span>Center of Pressure & Balance</h2>
     <div id="stance3d" class="stance-mount"><div class="stance-fallback" id="stance-loading">Loading 3D stance…</div></div>
-    <p class="stance-hint">drag to orbit · scroll to zoom · each shoe shows its live heading &amp; pressure</p>
-    <div class="loadbar"><div class="left" id="load-left" style="width:50%"></div><div class="right" id="load-right"></div></div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin:6px 2px 0;gap:12px">
+      <label class="toggle"><input type="checkbox" id="vision-toggle" disabled /> Vision foot positions <span class="k" id="vision-hint" style="margin-left:4px"></span></label>
+      <span class="stance-hint" style="margin:0">drag to orbit · scroll to zoom</span>
+    </div>
+    <div class="loadbar" style="margin-top:10px"><div class="left" id="load-left" style="width:50%"></div><div class="right" id="load-right"></div></div>
     <div class="loadlabels"><span>L <b id="load-left-pct">50%</b></span><span>Stability <b id="stability">—</b></span><span><b id="load-right-pct">50%</b> R</span></div>
     <div class="loadlabels" style="margin-top:8px"><span>◎ per-insole COP</span><span>● individual sensors</span><span>⬤ combined COP + sway</span></div>
   </div>
