@@ -273,45 +273,53 @@
   // ---------- SDK adapter (every BS.* touchpoint lives here) ----------
   const SDKAdapter = {
     devicePair: null, torso: null, pelvis: null,
+    pressureSensorCount: { left: 8, right: 8 },
 
     hasSDK() { return typeof window.BS !== "undefined"; },
 
     async connectInsoles() {
       if (!this.hasSDK()) { log("SDK not loaded — check network / unpkg.", "bad"); return; }
       try {
-        // TODO[SDK]: confirm singleton name — examples use BS.DevicePair.insoles
-        this.devicePair = BS.DevicePair.insoles || BS.DevicePair.shared;
-        this.devicePair.addEventListener("isConnected", (e) => {
-          const on = !!(e.message?.isConnected ?? this.devicePair.isConnected);
-          setConnected("insoles", on);
+        // BS.DevicePair.insoles is a singleton that auto-assigns any connected
+        // insole device to its left/right slot (verified against SDK v0.0.78 examples).
+        this.devicePair = BS.DevicePair.insoles;
+
+        // Overall pair connection state (both sides) drives the status dot.
+        this.devicePair.addEventListener("isConnected", () => {
+          setConnected("insoles", this.devicePair.isConnected);
         });
+
+        // Per-side connect: enable pressure streaming on each insole as it joins.
+        this.devicePair.addEventListener("deviceIsConnected", (e) => {
+          const { device, side, isConnected } = e.message;
+          if (!isConnected) return;
+          device.setSensorConfiguration({ pressure: CFG.sensorRateMs });
+          device.resetPressureRange?.();
+          this.pressureSensorCount[side] = device.numberOfPressureSensors ?? 8;
+          log(`${side} insole connected — ${this.pressureSensorCount[side]} pressure sensors @ ${CFG.sensorRateMs}ms.`);
+        });
+
+        // Combined center-of-pressure across BOTH insoles → the COP dot.
         this.devicePair.addEventListener("pressure", (e) => {
           const p = e.message.pressure;
           if (p?.normalizedCenter) onCop(p.normalizedCenter.x, p.normalizedCenter.y);
-          // Per-side loads + per-sensor values for the heatmaps.
-          // TODO[SDK]: confirm payload fields (sides[], sensors[], normalizedSum).
-          const side = e.message.side; // "left" | "right" on per-device events
-          if (side && p?.normalizedSum != null) {
+        });
+
+        // Per-side pressure → load split, step detection, and the pad heatmap.
+        this.devicePair.addEventListener("devicePressure", (e) => {
+          const { pressure: p, side } = e.message;
+          if (p?.normalizedSum != null) {
             S.sideLoad[side] = p.normalizedSum;
             onSideLoad(side, p.normalizedSum);
           }
-          if (side && Array.isArray(p?.sensors)) {
-            // TODO[SDK]: SDK sensor order vs. artwork pad order. Pads are anatomical
-            // (0:heel..7:hallux, see PAD_POS). If hardware order differs, fix this map.
-            const SDK_SENSOR_TO_PAD = [0, 1, 2, 3, 4, 5, 6, 7];
-            p.sensors.forEach((s, i) => {
-              S.sensors[side][SDK_SENSOR_TO_PAD[i]] = s.normalizedValue ?? s.value ?? 0;
-            });
-          }
+          if (Array.isArray(p?.sensors)) mapSensorsToPads(side, p.sensors);
         });
-        // Ask each insole to stream pressure
-        this.devicePair.setSensorConfiguration({ pressure: CFG.sensorRateMs });
-        this.devicePair.resetPressureRange?.();
-        // Trigger the browser's Web Bluetooth chooser for each side
-        // TODO[SDK]: confirm — examples call toggleConnection() per available device
-        (this.devicePair.sides ?? ["left", "right"]).forEach?.(() => {});
-        this.devicePair.toggleConnection?.();
-        log("Insoles: Web Bluetooth chooser opened. Pick left, then right.");
+
+        // Open the Web Bluetooth chooser; the pair grabs whatever insole is picked.
+        // Call once per foot (pick left, then click Connect again for right).
+        const device = new BS.Device();
+        device.connect();
+        log("Insoles: Bluetooth chooser opened. Pick one, then click Connect Insoles again for the other foot.");
       } catch (err) {
         log(`Insole connect failed: ${err.message}`, "bad");
       }
@@ -329,29 +337,31 @@
             log(`${which} Sense connected — hold still ~1s to calibrate upright.`);
           }
         });
-        // TODO[SDK]: confirm event name + payload ("gameRotation" → quaternion)
+        // gameRotation streams a magnetometer-fused quaternion (+ Euler) per sample.
         device.addEventListener("gameRotation", (e) => {
           const q = e.message.gameRotation ?? e.message.quaternion;
           if (!q) return;
           which === "torso" ? onTorsoQuat(q) : onPelvisQuat(q);
         });
-        device.toggleConnection();
+        device.connect();
+        log(`${which} Sense: Bluetooth chooser opened.`);
       } catch (err) {
         log(`${which} connect failed: ${err.message}`, "bad");
       }
     },
 
-    buzzInsoles() {
-      if (S.sim || !this.devicePair) return; // sim: log only
+    // Fire a single waveform effect on the connected insoles. Verified shape
+    // (SDK v0.0.78): segments is top-level under the config; effect from
+    // BS.VibrationWaveformEffects (e.g. strongBuzz100, strongClick100, tripleClick100).
+    buzz(effect = "strongBuzz100") {
+      if (S.sim || !this.devicePair) return; // sim / no hardware: no-op
       try {
-        // TODO[SDK]: confirm vibration API. Known shape from SDK demos:
-        this.devicePair.triggerVibration?.([
-          { type: "waveformEffect", waveformEffect: { segments: [{ effect: "strongBuzz100" }] } },
-        ]);
+        this.devicePair.triggerVibration?.([{ type: "waveformEffect", segments: [{ effect }] }]);
       } catch (err) {
-        log(`Vibration call failed (fix in SDKAdapter.buzzInsoles): ${err.message}`, "warn");
+        log(`Vibration call failed (fix in SDKAdapter.buzz): ${err.message}`, "warn");
       }
     },
+    buzzInsoles() { this.buzz("strongBuzz100"); },
   };
 
   function setConnected(which, on) {
@@ -424,6 +434,53 @@
   const COP_RECT = { x: 201, y: 177, w: 754, h: 700 };
   const PAD_RGB = { left: "0,212,170", right: "111,123,255" }; // matches L/R legend colors
 
+  // COP axis orientation: SDK normalizedCenter vs. this SVG's viewBox (y grows down).
+  // Best-guess defaults; if the live dot reads mirrored on hardware, flip the culprit.
+  const COP_FLIP_X = false, COP_FLIP_Y = true;
+  const fx = (v) => (COP_FLIP_X ? 1 - v : v);
+  const fy = (v) => (COP_FLIP_Y ? 1 - v : v);
+
+  // Per-foot pad centers normalized to [0,1] (heel≈y0, toe≈y1) for position-based
+  // sensor→pad assignment when an insole streams a sensor count other than 8.
+  const PAD_NORM = {};
+  for (const side of ["left", "right"]) {
+    const xs = PAD_POS[side].map((p) => p[0]), ys = PAD_POS[side].map((p) => p[1]);
+    const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+    PAD_NORM[side] = PAD_POS[side].map(([x, y]) => ({
+      x: (x - minX) / (maxX - minX || 1),
+      y: 1 - (y - minY) / (maxY - minY || 1), // viewBox toe is small-y → normalize toe→1
+    }));
+  }
+  // Identity for the 8-sensor insole; flip entries here if hardware order differs.
+  const SDK_SENSOR_TO_PAD = [0, 1, 2, 3, 4, 5, 6, 7];
+
+  // Fill S.sensors[side] (8 artwork pads) from a live per-sensor array of any length.
+  function mapSensorsToPads(side, sensors) {
+    const pads = S.sensors[side];
+    pads.fill(0);
+    if (sensors.length === 8) {
+      for (let i = 0; i < 8; i++) pads[SDK_SENSOR_TO_PAD[i]] = sensors[i].normalizedValue ?? sensors[i].value ?? 0;
+      return;
+    }
+    // Non-8 count (e.g. 16-sensor Ukaton beds): assign each sensor to the nearest
+    // artwork pad by its normalized position; brightest sensor wins the pad.
+    sensors.forEach((s, i) => {
+      const v = s.normalizedValue ?? s.value ?? 0;
+      let idx;
+      if (s.position) {
+        let best = Infinity; idx = 0;
+        for (let p = 0; p < 8; p++) {
+          const dx = s.position.x - PAD_NORM[side][p].x, dy = s.position.y - PAD_NORM[side][p].y;
+          const d = dx * dx + dy * dy;
+          if (d < best) { best = d; idx = p; }
+        }
+      } else {
+        idx = Math.min(7, Math.floor((i * 8) / sensors.length));
+      }
+      if (v > pads[idx]) pads[idx] = v;
+    });
+  }
+
   const ShoeStage = {
     ready: false, pads: { left: [], right: [] }, trail: [], dot: null,
     async init() {
@@ -458,15 +515,14 @@
           }
         });
       }
-      const cx = (COP_RECT.x + S.cop.x * COP_RECT.w).toFixed(1);
-      const cy = (COP_RECT.y + S.cop.y * COP_RECT.h).toFixed(1);
-      this.dot.setAttribute("cx", cx); this.dot.setAttribute("cy", cy);
+      this.dot.setAttribute("cx", (COP_RECT.x + fx(S.cop.x) * COP_RECT.w).toFixed(1));
+      this.dot.setAttribute("cy", (COP_RECT.y + fy(S.cop.y) * COP_RECT.h).toFixed(1));
       const n = S.copTrail.length;
       this.trail.forEach((c, i) => {
         const p = S.copTrail[n - this.trail.length + i];  // newest point → biggest circle
         if (!p) { c.setAttribute("opacity", "0"); return; }
-        c.setAttribute("cx", (COP_RECT.x + p.x * COP_RECT.w).toFixed(1));
-        c.setAttribute("cy", (COP_RECT.y + p.y * COP_RECT.h).toFixed(1));
+        c.setAttribute("cx", (COP_RECT.x + fx(p.x) * COP_RECT.w).toFixed(1));
+        c.setAttribute("cy", (COP_RECT.y + fy(p.y) * COP_RECT.h).toFixed(1));
         c.setAttribute("opacity", (0.45 * (i / this.trail.length)).toFixed(3));
       });
     },
@@ -540,11 +596,134 @@
     $("stability").textContent = st == null ? "—" : `${st}/100`;
   }
 
+  // ---------- data collection / recording ----------
+  // Two artifacts per session:
+  //   • raw JSON  — every device's raw sensorData in the SDK's own recording schema
+  //     (loads straight into the SDK's recording example loader/visualizer)
+  //   • derived CSV — the ergonomics timeline sampled ~10 Hz (COP, load split,
+  //     trunk angles, hinge delta, zone, running step/lift counts). Works in
+  //     Simulate too, so the capture→export flow is testable with no hardware.
+  const Recorder = {
+    active: false, raw: null, derived: [], startPerf: 0, lastDerivedT: 0,
+    bound: new WeakSet(),
+
+    init() {
+      if (!SDKAdapter.hasSDK()) return;
+      try {
+        BS.DeviceManager.addEventListener("deviceConnected", (e) => this.bind(e.message.device));
+        (BS.DeviceManager.connectedDevices || []).forEach((d) => this.bind(d));
+      } catch (err) { log(`Recorder init skipped: ${err.message}`, "warn"); }
+    },
+
+    bind(device) {
+      if (!device || this.bound.has(device)) return;
+      this.bound.add(device);
+      // One firehose event per device carries whichever sensor just updated.
+      device.addEventListener("sensorData", (e) => {
+        if (!this.active || !this.raw) return;
+        const { sensorType } = e.message;
+        const data = e.message[sensorType];
+        if (data == null) return;
+        let dr = this.raw.devices.find((x) => x.id === device.id);
+        if (!dr) { dr = { id: device.id, name: device.name, type: device.type, sensorData: [] }; this.raw.devices.push(dr); }
+        let st = dr.sensorData.find((x) => x.sensorType === sensorType);
+        if (!st) {
+          st = { sensorType, initialTimestamp: Date.now(), dataRate: device.sensorConfiguration?.[sensorType] ?? CFG.sensorRateMs, data: [] };
+          if (sensorType === "pressure") st.positions = device.pressureSensorPositions;
+          dr.sensorData.push(st);
+        }
+        st.data.push(sensorType === "pressure" ? data.sensors.map((s) => s.rawValue) : data);
+      });
+    },
+
+    toggle() { this.active ? this.stop() : this.start(); },
+
+    start() {
+      this.raw = { timestamp: Date.now(), devices: [] };
+      this.derived = []; this.startPerf = now(); this.lastDerivedT = 0;
+      this.active = true;
+      SDKAdapter.buzz("strongClick100");          // tactile "recording" cue on hardware
+      log("● Recording — walk / lift the scenario, then press Stop.", "warn");
+      updateRecUI();
+    },
+
+    stop() {
+      this.active = false;
+      if (this.raw) this.raw.finalTimestamp = Date.now();
+      SDKAdapter.buzz("tripleClick100");
+      const secs = ((now() - this.startPerf) / 1000).toFixed(1);
+      const streams = this.raw ? this.raw.devices.length : 0;
+      log(`■ Recording stopped — ${secs}s · ${this.derived.length} metric rows · ${streams} raw device stream(s).`);
+      if (!streams) log("No raw device streams captured (Simulate or no hardware) — CSV still has the metrics timeline.", "warn");
+      updateRecUI();
+    },
+
+    sampleDerived() {
+      if (!this.active) return;
+      const t = now();
+      if (t - this.lastDerivedT < 100) return;    // ~10 Hz
+      this.lastDerivedT = t;
+      const pf = S.pelvisFlexion;
+      this.derived.push({
+        t_ms: Math.round(t - this.startPerf),
+        cop_x: +S.cop.x.toFixed(4), cop_y: +S.cop.y.toFixed(4),
+        load_l: +S.sideLoad.left.toFixed(4), load_r: +S.sideLoad.right.toFixed(4),
+        flexion_deg: +S.flexion.toFixed(1), lean_deg: +S.lean.toFixed(1), twist_deg: +S.twist.toFixed(1),
+        pelvis_flexion_deg: pf == null ? "" : +pf.toFixed(1),
+        hinge_delta_deg: pf == null ? "" : +Math.abs(S.flexion - pf).toFixed(1),
+        zone: S.flexion >= CFG.flexionRed ? "red" : S.flexion >= CFG.flexionAmber ? "amber" : "green",
+        steps: S.steps, lifts: S.lifts, lifts_good: S.liftsGood, lifts_bad: S.liftsBad,
+        stability: stabilityScore() ?? "",
+      });
+    },
+
+    hasData() { return this.derived.length > 0 || (this.raw && this.raw.devices.length > 0); },
+
+    fileStamp() { return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19); },
+
+    download(filename, text, mime) {
+      const blob = new Blob([text], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename; a.style.display = "none";
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+    },
+
+    saveJSON() {
+      if (!this.raw) { log("Nothing to save yet — record a session first.", "warn"); return; }
+      this.download(`warehouse-ergo-raw-${this.fileStamp()}.json`, JSON.stringify(this.raw, null, 2), "application/json");
+      log("Saved raw sensor JSON (SDK recording schema).");
+    },
+
+    saveCSV() {
+      if (!this.derived.length) { log("No metrics timeline yet — record a session first.", "warn"); return; }
+      const cols = Object.keys(this.derived[0]);
+      const esc = (v) => (typeof v === "string" && /[",\n]/.test(v)) ? `"${v.replace(/"/g, '""')}"` : v;
+      const rows = this.derived.map((r) => cols.map((c) => esc(r[c])).join(","));
+      this.download(`warehouse-ergo-metrics-${this.fileStamp()}.csv`, [cols.join(","), ...rows].join("\n"), "text/csv");
+      log("Saved ergonomics metrics CSV.");
+    },
+  };
+
+  function updateRecUI() {
+    const btn = $("btn-record");
+    if (btn) {
+      btn.textContent = Recorder.active ? "■ Stop Recording" : "● Record";
+      btn.classList.toggle("recording", Recorder.active);
+    }
+    const has = Recorder.hasData() && !Recorder.active;
+    const j = $("btn-save-json"), c = $("btn-save-csv");
+    if (j) j.disabled = !(Recorder.raw && Recorder.raw.devices.length && !Recorder.active);
+    if (c) c.disabled = !has;
+  }
+
   // ---------- main loop ----------
   let lastFrame = now();
   function frame() {
     const t = now(), dt = t - lastFrame; lastFrame = t;
     if (S.sim) simTick(dt);
+    Recorder.sampleDerived();
     ShoeStage.render();
     drawGauge(); renderLoads(); drawStepMap();
     requestAnimationFrame(frame);
@@ -571,8 +750,13 @@
     });
     renderCounters(); renderGait(); log("Session reset.");
   };
+  $("btn-record").onclick = () => Recorder.toggle();
+  $("btn-save-json").onclick = () => Recorder.saveJSON();
+  $("btn-save-csv").onclick = () => Recorder.saveCSV();
 
   ShoeStage.init();
+  Recorder.init();
+  updateRecUI();
   log("Ready. Connect devices, or press Simulate to preview without hardware.");
   if (!SDKAdapter.hasSDK()) log("Note: SDK global not detected — connect buttons will be inert; Simulate works.", "warn");
   frame();

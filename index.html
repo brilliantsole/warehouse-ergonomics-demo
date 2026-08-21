@@ -31,6 +31,9 @@
   button.primary { background: var(--teal); border-color: var(--teal); color: #06251d; font-weight: 650; }
   button.connected { background: var(--teal-dim); border-color: var(--teal-dim); color: #04211a; font-weight: 650; }
   button.danger { border-color: var(--red); color: var(--red); }
+  button.recording { background: var(--red); border-color: var(--red); color: #2a0710; font-weight: 700; animation: recpulse 1.2s ease-in-out infinite; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  @keyframes recpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,84,104,.5); } 50% { box-shadow: 0 0 0 6px rgba(255,84,104,0); } }
   .grid { display: grid; gap: 14px; grid-template-columns: repeat(12, 1fr); }
   .card {
     grid-column: span 4; background: linear-gradient(180deg, var(--panel) 0%, rgba(33,38,92,.6) 100%);
@@ -92,6 +95,9 @@
     <button id="btn-torso">⊙ Connect Torso Sense</button>
     <button id="btn-pelvis">⊙ Connect Pelvis Sense</button>
     <button id="btn-sim" class="primary">▶ Simulate</button>
+    <button id="btn-record">● Record</button>
+    <button id="btn-save-csv" disabled>Save CSV</button>
+    <button id="btn-save-json" disabled>Save JSON</button>
     <button id="btn-reset" class="danger">Reset Session</button>
   </div>
 </header>
