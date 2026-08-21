@@ -91,14 +91,7 @@
     <span class="sub">Warehouse Ergonomics Demo — footsteps · balance · center of pressure · posture</span>
   </div>
   <div class="controls">
-    <button id="btn-insoles">⊙ Connect Insoles</button>
-    <button id="btn-torso">⊙ Connect Torso Sense</button>
-    <button id="btn-pelvis">⊙ Connect Pelvis Sense</button>
     <button id="btn-sim" class="primary">▶ Simulate</button>
-    <button id="btn-record">● Record</button>
-    <button id="btn-save-csv" disabled>Save CSV</button>
-    <button id="btn-save-json" disabled>Save JSON</button>
-    <button id="btn-reset" class="danger">Reset Session</button>
   </div>
 </header>
 
@@ -113,6 +106,7 @@
     </div>
     <div class="loadbar"><div class="left" id="load-left" style="width:50%"></div><div class="right" id="load-right"></div></div>
     <div class="loadlabels"><span>L <b id="load-left-pct">50%</b></span><span>Stability <b id="stability">—</b></span><span><b id="load-right-pct">50%</b> R</span></div>
+    <div class="loadlabels" style="margin-top:8px"><span>◎ per-insole COP</span><span>● individual sensors</span><span>⬤ combined COP + sway</span></div>
   </div>
 
   <!-- Posture -->
