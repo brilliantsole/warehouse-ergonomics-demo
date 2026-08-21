@@ -110,7 +110,12 @@
     }
     const rel = quatMul(quatConj(S.baselineTorso), q);
     const e = quatToEuler(rel);
-    S.flexion = Math.abs(e.pitch);
+    // Flexion = total tilt of the segment away from its calibrated upright pose,
+    // measured as the angle between the rest "up" axis and the live one. This is
+    // axis-agnostic (mount the Sense any way up) and never wraps through ±180°,
+    // unlike reading a single Euler pitch — which is what real WE 4 data exposed
+    // (the upper-back unit flexes about its roll axis, pitch read 152°).
+    S.flexion = tiltDeg(S.baselineTorso, q);
     S.lean = e.roll;
     S.twist = e.yaw;
     if (!S.sim) S.heading = S.twist; // hardware: torso yaw steers the footstep map
@@ -118,8 +123,25 @@
   }
   function onPelvisQuat(q) {
     if (!S.baselinePelvis) { S.baselinePelvis = q; return; }
-    const rel = quatMul(quatConj(S.baselinePelvis), q);
-    S.pelvisFlexion = Math.abs(quatToEuler(rel).pitch);
+    S.pelvisFlexion = tiltDeg(S.baselinePelvis, q);
+  }
+  // Tilt (deg, 0..180) of a body segment away from its calibrated upright pose.
+  // World "up" expressed in the device frame at rest is g = rest⁻¹·(0,1,0); the
+  // live quaternion rotates that same device vector to world space as live·g.
+  // The angle between world-up and live·g is the tilt — independent of how the
+  // Sense is mounted (which device axis points up) and free of Euler wrap.
+  function tiltDeg(rest, live) {
+    const gDev = rotateVec(quatConj(rest), [0, 1, 0]);   // device-frame "up" at rest
+    const gNow = rotateVec(live, gDev);                   // where that axis points now
+    const cosT = Math.max(-1, Math.min(1, gNow[1]));      // dot with world up (0,1,0)
+    return Math.acos(cosT) * 180 / Math.PI;
+  }
+  function rotateVec(q, v) {
+    // v' = q v q*  (q unit quaternion, v as pure quaternion)
+    const { x, y, z, w } = q;
+    const [vx, vy, vz] = v;
+    const tx = 2 * (y * vz - z * vy), ty = 2 * (z * vx - x * vz), tz = 2 * (x * vy - y * vx);
+    return [vx + w * tx + (y * tz - z * ty), vy + w * ty + (z * tx - x * tz), vz + w * tz + (x * ty - y * tx)];
   }
 
   function updatePosture() {
