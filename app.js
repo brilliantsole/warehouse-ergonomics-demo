@@ -680,7 +680,7 @@
   // Capture happens in the BrilliantWear portal. Here we LOAD a recording it
   // produced (raw sensor JSON + the webcam clip) and replay the whole warehouse
   // dashboard scrubbed in sync with the video — the golf-demo review experience.
-  const Session = { frames: [], footEvents: [], video: null, durationMs: 0, footTrack: null };
+  const Session = { frames: [], footEvents: [], video: null, durationMs: 0, footTrack: null, raw: null, rawFormat: null, title: "" };
   const videoWrap = () => document.querySelector(".video-wrap");
   let lastReplayMs = 0; // remembered so the vision toggle can re-plot the current moment
 
@@ -999,6 +999,8 @@
       else if (rec) n = deriveFromRecording(rec);
     } catch (e) { log(`Couldn't read that recording: ${e.message}`, "bad"); return; }
     if (!n) { log("No usable sensor data in that file.", "warn"); return; }
+    if (portal || rec) { Session.raw = portal || rec; Session.rawFormat = portal ? "portal" : "sdk"; Session.title = portal?.recording?.title || (jsonFiles[0]?.name || "").replace(/\.json$/i, "") || Session.title; }
+    setExportAvailable(!!Session.raw);
 
     if (videoFile) {
       if (Session.video?.url) URL.revokeObjectURL(Session.video.url);
@@ -1009,7 +1011,90 @@
     const tf = Session.footTrack ? ` + foot-track (${Session.footTrack.frames.length} frames)` : "";
     log(`Loaded recording — ${n} frames${videoFile ? ` + video (${videoFile.name})` : ""}${tf}.`);
     setVisionAvailable(!!Session.footTrack);
+    setTitle(Session.title);
     enterReplay();
+  }
+
+  // ---------- gallery / URL loading + raw export ----------
+  function stamp() { return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19); }
+  function download(name, text, mime) {
+    const url = URL.createObjectURL(new Blob([text], { type: mime }));
+    const a = document.createElement("a"); a.href = url; a.download = name; a.style.display = "none";
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+  }
+  function setTitle(t) { const el = $("rec-title"); if (el) el.textContent = t ? `— ${t}` : ""; }
+  function setExportAvailable(avail) {
+    ["btn-json", "btn-csv"].forEach((id) => { const b = $(id); if (b) b.disabled = !avail; });
+  }
+  const slug = (s) => (s || "recording").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "recording";
+
+  // Raw-data exports (the loaded recording, unmodified) — JSON as-is; CSV = raw rows.
+  function exportRawJSON() {
+    if (!Session.raw) { log("Load a recording first.", "warn"); return; }
+    download(`${slug(Session.title)}-${stamp()}.json`, JSON.stringify(Session.raw), "application/json");
+    log("Saved raw JSON.");
+  }
+  function exportRawCSV() {
+    if (!Session.raw) { log("Load a recording first.", "warn"); return; }
+    const csv = rawToCsv(Session.raw, Session.rawFormat);
+    if (!csv) { log("No tabular sensor rows to export.", "warn"); return; }
+    download(`${slug(Session.title)}-${stamp()}.csv`, csv, "text/csv");
+    log("Saved raw CSV.");
+  }
+  // Flatten to a long CSV: one row per sensor sample (portal scalar+pressure rows;
+  // SDK per-device sensorData). Header union across row types; blanks where N/A.
+  function rawToCsv(raw, fmt) {
+    const rows = [];
+    if (fmt === "portal") {
+      for (const r of (raw.scalar || [])) rows.push({ time: r.time, device_id: r.device_id, sensor_type: r.sensor_type, x: r.x, y: r.y, z: r.z, w: r.w });
+      for (const r of (raw.pressure || [])) rows.push({ time: r.time, device_id: r.device_id, sensor_type: "pressure", normalized_sum: r.normalized_sum, normalized_center_x: r.normalized_center_x, normalized_center_y: r.normalized_center_y });
+    } else if (fmt === "sdk") {
+      for (const d of (raw.devices || [])) for (const s of (d.sensorData || [])) (s.data || []).forEach((v, i) => {
+        const t = (s.initialTimestamp || 0) + i * (s.dataRate || 20);
+        if (s.sensorType === "pressure") rows.push({ time: t, device_id: d.id, sensor_type: "pressure", values: JSON.stringify(v) });
+        else rows.push({ time: t, device_id: d.id, sensor_type: s.sensorType, x: v?.x, y: v?.y, z: v?.z, w: v?.w });
+      });
+    }
+    if (!rows.length) return "";
+    const cols = [...rows.reduce((set, r) => { Object.keys(r).forEach((k) => set.add(k)); return set; }, new Set())];
+    const esc = (v) => v == null ? "" : (typeof v === "string" && /[",\n]/.test(v)) ? `"${v.replace(/"/g, '""')}"` : v;
+    return [cols.join(","), ...rows.map((r) => cols.map((c) => esc(r[c])).join(","))].join("\n");
+  }
+
+  // Load a recording by URL (gallery card / ?rec= deep link): fetch JSON (+ optional
+  // video + foot-track) from the site, derive, and replay. `entry` = manifest row.
+  async function loadRecordingByUrl(entry) {
+    try {
+      log(`Loading “${entry.title || entry.id}”…`);
+      Session.footTrack = null;
+      const raw = await fetch(entry.json).then((r) => { if (!r.ok) throw new Error(`data ${r.status}`); return r.json(); });
+      if (entry.footTrack) Session.footTrack = await fetch(entry.footTrack).then((r) => r.ok ? r.json() : null).catch(() => null);
+      const isPortal = raw && raw.recording && (Array.isArray(raw.scalar) || Array.isArray(raw.pressure));
+      const n = isPortal ? deriveFromPortalExport(raw) : deriveFromRecording(raw);
+      if (!n) { log("No usable sensor data.", "warn"); return; }
+      Session.raw = raw; Session.rawFormat = isPortal ? "portal" : "sdk"; Session.title = entry.title || raw.recording?.title || entry.id;
+      if (Session.video?.url) URL.revokeObjectURL(Session.video.url);
+      Session.video = null;
+      if (entry.video) {
+        const vb = await fetch(entry.video).then((r) => r.ok ? r.blob() : null).catch(() => null);
+        if (vb) Session.video = { url: URL.createObjectURL(vb), syncOffsetMs: entry.syncOffsetMs || 0 };
+      }
+      log(`Loaded “${Session.title}” — ${n} frames${Session.video ? " + video" : ""}.`);
+      setVisionAvailable(!!Session.footTrack); setExportAvailable(true); setTitle(Session.title);
+      enterReplay();
+    } catch (e) { log(`Couldn't load recording: ${e.message}`, "bad"); }
+  }
+
+  async function autoLoadFromUrl() {
+    const id = new URLSearchParams(location.search).get("rec");
+    if (!id) return;
+    try {
+      const man = await fetch("recordings/manifest.json").then((r) => r.ok ? r.json() : null);
+      const entry = man && (man.recordings || []).find((e) => e.id === id);
+      if (entry) loadRecordingByUrl(entry);
+      else log(`Recording “${id}” not found in the gallery.`, "warn");
+    } catch (e) { log(`Gallery manifest unavailable: ${e.message}`, "warn"); }
   }
 
   // ---------- main loop ----------
@@ -1040,6 +1125,8 @@
   };
   $("btn-load").onclick = () => $("file-in").click();
   $("file-in").onchange = (e) => { handleFiles(e.target.files); e.target.value = ""; };
+  $("btn-json").onclick = () => exportRawJSON();
+  $("btn-csv").onclick = () => exportRawCSV();
   $("vision-toggle").onchange = (e) => {
     S.useVision = e.target.checked;
     log(`Foot positions: ${S.useVision ? "vision (Pose + Depth)" : "insole estimate"}.`);
@@ -1050,6 +1137,8 @@
   window.WH = { S, CFG, PAD_NORM };
 
   ShoeStage.init();
+  setExportAvailable(false);
   log("Ready. Press ▶ Simulate to preview, or Load Recording to replay a portal capture synced to its video.");
   frame();
+  autoLoadFromUrl(); // ?rec=<id> deep link from the recordings gallery
 })();

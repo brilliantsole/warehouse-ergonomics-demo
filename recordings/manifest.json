@@ -1,0 +1,22 @@
+{
+ "recordings": [
+  {
+   "id": "we4",
+   "title": "WE 4 \u2014 walk + lifts (full sensor set)",
+   "date": "2026-08-21",
+   "durationSec": 48,
+   "devices": 4,
+   "sensors": [
+    "pressure",
+    "gameRotation",
+    "linearAcceleration",
+    "stepDetector"
+   ],
+   "json": "recordings/we4.json",
+   "video": "recordings/we4.mp4",
+   "syncOffsetMs": 806,
+   "format": "portal",
+   "note": "Insoles + upper-back & pelvis Sense, Warehouse ergonomics preset, synced webcam."
+  }
+ ]
+}
