@@ -824,6 +824,84 @@
     return frames.length;
   }
 
+  // Re-derive the warehouse dashboard from the PORTAL export format (flat, timestamped
+  // rows: recording.devices[] + scalar[] + pressure[] + events[]). Pressure rows already
+  // carry per-sensor normalizedValue + position + per-foot normalizedCenter, so no
+  // auto-range needed. gameRotation (when the recording has it) comes from scalar rows.
+  function deriveFromPortalExport(exp) {
+    const devs = exp.recording?.devices || [];
+    const roleOf = (placement, side) => {
+      const p = String(placement || "").toLowerCase();
+      if (p === "left foot") return "footL";
+      if (p === "right foot") return "footR";
+      if (/back|torso|thorax/.test(p)) return "torso";
+      if (/pelvis|sacrum|hip|waist/.test(p)) return "pelvis";
+      return null;
+    };
+    const role = {}; // device_id → role (first assignment wins on duplicate placements)
+    for (const d of devs) {
+      let r = roleOf(d.placement, d.deviceSide);
+      if (!r && d.deviceType === "insole") r = d.deviceSide === "right" ? "footR" : "footL";
+      if (r && !Object.values(role).includes(r)) role[d.deviceId] = r;
+      else if (r) role[d.deviceId] = r + "_dup"; // keep but don't map (jumbled recording)
+    }
+    const idFor = (want) => Object.keys(role).find((id) => role[id] === want);
+    const ids = { footL: idFor("footL"), footR: idFor("footR"), torso: idFor("torso"), pelvis: idFor("pelvis") };
+
+    const ms = (iso) => Date.parse(iso);
+    let t0 = Infinity;
+    for (const arr of [exp.scalar, exp.pressure]) for (const r of (arr || [])) { const m = ms(r.time); if (m < t0) t0 = m; }
+    if (!Number.isFinite(t0)) return 0;
+
+    // group + sort streams by device
+    const pByDev = {}, grByDev = {};
+    for (const r of (exp.pressure || [])) (pByDev[r.device_id] ||= []).push(r);
+    for (const r of (exp.scalar || [])) if (r.sensor_type === "gameRotation" || r.sensor_type === "rotation") (grByDev[r.device_id] ||= []).push(r);
+    const prep = (rows) => (rows || []).map((r) => ({ ...r, t: ms(r.time) - t0 })).sort((a, b) => a.t - b.t);
+    const P = { footL: prep(pByDev[ids.footL]), footR: prep(pByDev[ids.footR]) };
+    const GR = { footL: prep(grByDev[ids.footL]), footR: prep(grByDev[ids.footR]), torso: prep(grByDev[ids.torso]), pelvis: prep(grByDev[ids.pelvis]) };
+    const nearest = (rows, t) => { if (!rows || !rows.length) return null; let lo = 0, hi = rows.length - 1, i = 0; while (lo <= hi) { const m = (lo + hi) >> 1; if (rows[m].t <= t) { i = m; lo = m + 1; } else hi = m - 1; } return rows[i]; };
+    const duration = (() => { let d = 1000; for (const s of [P.footL, P.footR, GR.torso, GR.pelvis, GR.footL, GR.footR]) if (s && s.length) d = Math.max(d, s[s.length - 1].t); return d; })();
+
+    resetSession();
+    const grQuat = (r) => (r && r.w != null ? { x: r.x, y: r.y, z: r.z, w: r.w } : null);
+    S.baselineTorso = grQuat(nearest(GR.torso, 0)) || eulerToQuat(0, 0, 0);
+    S.baselinePelvis = grQuat(nearest(GR.pelvis, 0)) || null;
+    const gr0 = { footL: grQuat(nearest(GR.footL, 0)), footR: grQuat(nearest(GR.footR, 0)) };
+    const footYawFrom = (rows, base, t, flare) => { const q = grQuat(nearest(rows, t)); if (!q || !base) return flare; return flare + quatToEuler(quatMul(quatConj(base), q)).yaw; };
+
+    Deriving.on = true; Deriving.footEvents = []; suppressLog = true;
+    const frames = []; let lastSnap = -1000; const STEP = 50;
+    const doFoot = (side, key) => {
+      const row = nearest(P[key], CLOCK);
+      if (!row || !Array.isArray(row.sensors)) return 0.5;
+      mapSensorsToPads(side, row.sensors); // sensors[i] = {normalizedValue, position}
+      const load = row.normalized_sum != null ? row.normalized_sum : row.sensors.reduce((a, s) => a + (s.normalizedValue || 0), 0) / (row.sensors.length || 1);
+      if (row.normalized_center_x != null && row.normalized_center_y != null) onFootCop(side, row.normalized_center_x, row.normalized_center_y);
+      else { const fc = footCopFromSensors(side); onFootCop(side, fc.x, fc.y); }
+      return Math.max(0, Math.min(1, load));
+    };
+    for (let t = 0; t <= duration; t += STEP) {
+      CLOCK = t;
+      const loadL = doFoot("left", "footL"), loadR = doFoot("right", "footR");
+      onSideLoad("left", loadL); onSideLoad("right", loadR);
+      S.sideLoad.left = loadL; S.sideLoad.right = loadR;
+      const wsum = Math.max(0.001, loadL + loadR);
+      onCop((loadL * (S.copFoot.left.x * 0.5) + loadR * (0.5 + S.copFoot.right.x * 0.5)) / wsum, (loadL * S.copFoot.left.y + loadR * S.copFoot.right.y) / wsum);
+      const qt = grQuat(nearest(GR.torso, t)); if (qt) onTorsoQuat(qt);
+      const qp = grQuat(nearest(GR.pelvis, t)); if (qp) onPelvisQuat(qp);
+      if (qt) S.heading = S.twist;
+      S.footYaw.left = footYawFrom(GR.footL, gr0.footL, t, -11);
+      S.footYaw.right = footYawFrom(GR.footR, gr0.footR, t, 11);
+      if (t - lastSnap >= 100) { lastSnap = t; frames.push(snapshotFrame(t)); }
+    }
+    CLOCK = null; Deriving.on = false; suppressLog = false;
+    Session.frames = frames; Session.footEvents = Deriving.footEvents; Session.durationMs = duration;
+    const has = { footL: !!ids.footL, footR: !!ids.footR, torso: !!ids.torso, pelvis: !!ids.pelvis, gameRotation: (GR.torso.length + GR.footL.length + GR.footR.length) > 0 };
+    log(`Portal export: feet[${has.footL ? "L" : "–"}${has.footR ? "R" : "–"}] torso:${has.torso ? "y" : "–"} pelvis:${has.pelvis ? "y" : "–"} gameRotation:${has.gameRotation ? "y" : "NO (no posture/heading)"}.`, has.gameRotation ? "" : "warn");
+    return frames.length;
+  }
+
   function enterReplay() {
     if (!Session.frames.length) return;
     if (S.sim) { S.sim = false; $("btn-sim").textContent = "▶ Simulate"; $("btn-sim").classList.add("primary"); }
@@ -900,25 +978,30 @@
     const jsonFiles = files.filter((f) => /\.json$/i.test(f.name) || (f.type || "").includes("json"));
     const videoFile = files.find((f) => (f.type || "").startsWith("video/") || /\.(webm|mp4|mov|m4v)$/i.test(f.name));
 
-    // Classify the JSON file(s): one recording + optional foot-track.
-    let rec = null, track = null;
+    // Classify the JSON file(s): a recording (portal-export OR SDK-nested) + optional foot-track.
+    let rec = null, portal = null, track = null;
     for (const jf of jsonFiles) {
       let obj; try { obj = await readJSON(jf); } catch (e) { log(`Bad JSON (${jf.name}): ${e.message}`, "bad"); return; }
       if (isFootTrack(obj, jf.name)) track = obj;
-      else { rec = obj; if (!track && obj.footTrack) track = obj.footTrack; } // recording may embed a foot-track
+      else if (obj && obj.recording && (Array.isArray(obj.scalar) || Array.isArray(obj.pressure))) portal = obj; // portal /export
+      else { rec = obj; if (!track && obj.footTrack) track = obj.footTrack; } // SDK-nested; may embed a foot-track
     }
 
-    if (!rec && !Session.frames.length && !track) { log("Select the recording's data JSON (and optionally its video + foot-track).", "warn"); return; }
+    if (!rec && !portal && !Session.frames.length && !track) { log("Select the recording's data JSON (and optionally its video + foot-track).", "warn"); return; }
 
     if (track) Session.footTrack = track; // set BEFORE derive so footstep events can bake vision positions
     let n = Session.frames.length;
-    if (rec) { try { n = deriveFromRecording(rec); } catch (e) { log(`Couldn't read that recording: ${e.message}`, "bad"); return; } }
+    try {
+      if (portal) n = deriveFromPortalExport(portal);
+      else if (rec) n = deriveFromRecording(rec);
+    } catch (e) { log(`Couldn't read that recording: ${e.message}`, "bad"); return; }
     if (!n) { log("No usable sensor data in that file.", "warn"); return; }
 
     if (videoFile) {
       if (Session.video?.url) URL.revokeObjectURL(Session.video.url);
-      Session.video = { url: URL.createObjectURL(videoFile), syncOffsetMs: (rec && rec.video && rec.video.syncOffsetMs) || (track && track.video && track.video.syncOffsetMs) || 0 };
-    } else if (rec) { Session.video = null; }
+      const off = (rec && rec.video && rec.video.syncOffsetMs) || (portal && portal.video && portal.video.syncOffsetMs) || (track && track.video && track.video.syncOffsetMs) || 0;
+      Session.video = { url: URL.createObjectURL(videoFile), syncOffsetMs: off };
+    } else if (rec || portal) { Session.video = null; }
 
     const tf = Session.footTrack ? ` + foot-track (${Session.footTrack.frames.length} frames)` : "";
     log(`Loaded recording — ${n} frames${videoFile ? ` + video (${videoFile.name})` : ""}${tf}.`);

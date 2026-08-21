@@ -29,11 +29,20 @@ individual sensor pressure, trunk flexion / hip-hinge-vs-stoop, footstep map, st
 and plays it back **synced to the video**: scrub or play the clip and the dashboard follows. With no
 video, a slider scrubs the data. Everything runs locally in the browser; nothing is uploaded.
 
-Accepted data JSON = the SDK/portal recording schema: `devices[].sensorData[]` with pressure
-`rawValue` arrays + sensor `positions`, and `gameRotation` (or `rotation`) quaternions, each with
-`initialTimestamp` + `dataRate`. Device role comes from `type` (`leftInsole`/`rightInsole`) and
-`placement` (`upper back` → torso, `pelvis` → pelvis); generic Sense units otherwise fall back to
-first-torso / second-pelvis. Video sync uses `video.syncOffsetMs` from the JSON if present, else 0.
+Two recording JSON shapes are accepted:
+
+1. **Portal export** (from the portal's `GET /recordings/:id/export?format=json`, or the detail page's
+   Download JSON) — flat, timestamped rows: `recording.devices[]` + `scalar[]` (`{time, device_id,
+   sensor_type, x/y/z/w}`) + `pressure[]` (`{time, device_id, normalized_center_x/y, normalized_sum,
+   sensors:[{position, normalizedValue, …}]}`) + `events[]`. Device role comes from each device's
+   `placement` (`left foot`/`right foot` → feet, `upper back` → torso, `pelvis` → pelvis). Pressure is
+   already normalized so it maps straight in; posture/heading need `gameRotation` (or `rotation`) in
+   `scalar`, which requires recording with the **Warehouse ergonomics preset** (the default preset
+   streams only acceleration/gyroscope → no orientation).
+2. **SDK-nested** (`devices[].sensorData[]` with `rawValue` arrays + `positions` + `dataRate`).
+
+Video sync uses `video.syncOffsetMs` from the JSON if present, else 0. (The portal keeps `syncOffsetMs`
+on the video track, not in the JSON export — align with the scrubber if the downloaded clip looks off.)
 
 ## Vision foot positions (experimental)
 
