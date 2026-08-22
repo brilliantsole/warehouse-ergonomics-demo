@@ -36,7 +36,13 @@
     stepsPerSide: { left: 0, right: 0 },
     cop: { x: 0.5, y: 0.5 }, copTrail: [], copHistory: [],
     copFoot: { left: { x: 0.5, y: 0.5 }, right: { x: 0.5, y: 0.5 } }, // per-insole COP
-    footYaw: { left: -10, right: 10 }, // per-insole heading (deg), relative orientation for the 3D stance
+    footYaw: { left: -10, right: 10 }, // per-insole heading (deg) — used by the footstep map
+    // per-insole FULL relative orientation (inverse(rest)·live, unit quaternion) for the 3D
+    // shoes — a lone Euler yaw is meaningless near gimbal lock mid-stride on real insoles
+    footQ: { left: { x: 0, y: 0, z: 0, w: 1 }, right: { x: 0, y: 0, z: 0, w: 1 } },
+    // per-insole step height (m, ≥0): the foot is in the air when it's UNLOADED and TILTED;
+    // derived from the insole alone (no camera needed)
+    footLift: { left: 0, right: 0 },
     // vision-derived foot POSITION (from Pose + Depth Anything over the recorded clip):
     // x = lateral (m, + = right), z = forward (m, + = away from camera), y = lift (m), c = confidence 0..1
     footPos: { left: { x: -0.15, y: 0, z: 0, c: 0 }, right: { x: 0.15, y: 0, z: 0, c: 0 } },
@@ -125,6 +131,24 @@
     if (!S.baselinePelvis) { S.baselinePelvis = q; return; }
     S.pelvisFlexion = tiltDeg(S.baselinePelvis, q);
   }
+  // Per-insole orientation + step height from the foot's own gameRotation + load.
+  //   footQ   = inverse(rest)·live (full relative quaternion) — drives the 3D shoe
+  //   footLift = height the foot is off the ground, from swing-phase geometry:
+  //     a foot that is unloaded AND tilted is in the air (real WE 4 data: tilt
+  //     ~1–2° when loaded, 15–45° when unloaded). Lift ≈ half the foot length
+  //     raised by the tilt, gated by unload so a planted-but-rocking foot stays down.
+  const FOOT_LEN_M = 0.27;
+  function updateFootOrientation(side, restQ, liveQ, load) {
+    if (!restQ || !liveQ) return;
+    const rel = quatMul(quatConj(restQ), liveQ);
+    const n = Math.hypot(rel.x, rel.y, rel.z, rel.w) || 1;
+    S.footQ[side] = { x: rel.x / n, y: rel.y / n, z: rel.z / n, w: rel.w / n };
+    const tilt = tiltDeg(restQ, liveQ);
+    const unload = Math.max(0, Math.min(1, (0.45 - (load ?? 1)) / 0.35)); // 1 when load<0.10, 0 when load>0.45
+    const lift = unload * (FOOT_LEN_M / 2) * Math.sin(Math.min(tilt, 80) * Math.PI / 180);
+    S.footLift[side] = +Math.max(0, lift).toFixed(3);
+  }
+
   // Tilt (deg, 0..180) of a body segment away from its calibrated upright pose.
   // World "up" expressed in the device frame at rest is g = rest⁻¹·(0,1,0); the
   // live quaternion rotates that same device vector to world space as live·g.
@@ -481,6 +505,16 @@
     const ty = S.simT / 1000;
     S.footYaw.left = -11 + 4 * Math.sin(ty * 1.3) + rnd(1.5);
     S.footYaw.right = 11 + 4 * Math.sin(ty * 1.3 + 0.6) + rnd(1.5);
+    // synthesize each foot's full orientation + step height for the 3D shoes: the
+    // unloaded (swing) foot pitches toe-up and lifts; the planted foot stays flat
+    const simFoot = (side, load) => {
+      const swing = Math.max(0, Math.min(1, (0.45 - load) / 0.35));
+      const pitch = swing * 22 + rnd(1);                      // toe-up during swing
+      const q = eulerToQuat(pitch, rnd(1.5), S.footYaw[side]); // (pitch, roll, yaw)
+      S.footQ[side] = q;
+      S.footLift[side] = +(swing * 0.09).toFixed(3);          // ~9 cm peak step height
+    };
+    simFoot("left", loadL); simFoot("right", loadR);
     if (!S.baselineTorso) S.baselineTorso = eulerToQuat(0, 0, 0);
     if (!S.baselinePelvis) S.baselinePelvis = eulerToQuat(0, 0, 0);
     onTorsoQuat(eulerToQuat(torsoFlex, rnd(3), rnd(4)));
@@ -740,7 +774,9 @@
     t.checked = avail;               // default ON when a foot-track loads
     S.useVision = avail;
     const hint = $("vision-hint");
-    if (hint) hint.textContent = avail ? "vision foot-track loaded" : "";
+    // Make the gating explicit: the toggle only does anything with a camera-derived
+    // foot-track loaded (made by tools/foot-track-extractor.html); without one it's inert.
+    if (hint) hint.textContent = avail ? "foot-track loaded" : "— needs a foot-track file (tools/foot-track-extractor.html)";
   }
 
   function resetSession() {
@@ -767,6 +803,9 @@
       st: S.steps, li: S.lifts, lg: S.liftsGood, lb: S.liftsBad, stab: stabilityScore(),
       sl: S.sensors.left.map((v) => +v.toFixed(3)), sr: S.sensors.right.map((v) => +v.toFixed(3)),
       fyl: +S.footYaw.left.toFixed(1), fyr: +S.footYaw.right.toFixed(1),
+      fql: [S.footQ.left.x, S.footQ.left.y, S.footQ.left.z, S.footQ.left.w].map((v) => +v.toFixed(4)),
+      fqr: [S.footQ.right.x, S.footQ.right.y, S.footQ.right.z, S.footQ.right.w].map((v) => +v.toFixed(4)),
+      lfl: S.footLift.left, lfr: S.footLift.right,
     };
   }
 
@@ -842,6 +881,9 @@
       let loadL = 0.5, loadR = 0.5;
       if (sL) { mapSensorsToPads("left", sL); loadL = sL.reduce((a, b) => a + b.normalizedValue, 0) / (sL.length || 1); }
       if (sR) { mapSensorsToPads("right", sR); loadR = sR.reduce((a, b) => a + b.normalizedValue, 0) / (sR.length || 1); }
+      // full relative orientation + step height per foot (3D shoes)
+      updateFootOrientation("left", gr0.left, quatOf(at(streams.footLgr, t)), loadL);
+      updateFootOrientation("right", gr0.right, quatOf(at(streams.footRgr, t)), loadR);
       onSideLoad("left", loadL); onSideLoad("right", loadR);
       S.sideLoad.left = loadL; S.sideLoad.right = loadR;
       const fcL = footCopFromSensors("left"), fcR = footCopFromSensors("right");
@@ -924,6 +966,9 @@
       S.footYaw.left = footYawFrom(GR.footL, gr0.footL, t, -11);
       S.footYaw.right = footYawFrom(GR.footR, gr0.footR, t, 11);
       const loadL = doFoot("left", "footL"), loadR = doFoot("right", "footR");
+      // full relative orientation + step height per foot (3D shoes)
+      updateFootOrientation("left", gr0.footL, grQuat(nearest(GR.footL, t)), loadL);
+      updateFootOrientation("right", gr0.footR, grQuat(nearest(GR.footR, t)), loadR);
       onSideLoad("left", loadL); onSideLoad("right", loadR);
       S.sideLoad.left = loadL; S.sideLoad.right = loadR;
       const wsum = Math.max(0.001, loadL + loadR);
@@ -997,6 +1042,10 @@
     S.flexion = fr.fx; S.lean = fr.ln; S.twist = fr.tw; S.pelvisFlexion = fr.pf;
     if (fr.fyl != null) S.footYaw.left = fr.fyl;
     if (fr.fyr != null) S.footYaw.right = fr.fyr;
+    if (fr.fql) S.footQ.left = { x: fr.fql[0], y: fr.fql[1], z: fr.fql[2], w: fr.fql[3] };
+    if (fr.fqr) S.footQ.right = { x: fr.fqr[0], y: fr.fqr[1], z: fr.fqr[2], w: fr.fqr[3] };
+    if (fr.lfl != null) S.footLift.left = fr.lfl;
+    if (fr.lfr != null) S.footLift.right = fr.lfr;
     S.steps = fr.st; S.lifts = fr.li; S.liftsGood = fr.lg; S.liftsBad = fr.lb;
     S.stabilityOverride = fr.stab;
     S.copTrail = [];

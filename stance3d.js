@@ -21,7 +21,11 @@ const BED_ROTATION_Z = { left: Math.PI, right: Math.PI };
 const PAD_MIRROR_X = { left: 1, right: -1 };
 const SHOE_MODEL_YAW = Math.PI;
 const PAD_RADIUS = 0.7, TRAIL_POINTS = 16;
-const POS_SCALE = 70; // vision foot-track metres → scene units (tune to shoe scale)
+const POS_SCALE = 70; // metres → scene units (foot-track positions + insole-derived step height)
+// Device world → scene world is mirrored across the sagittal plane (golf widget,
+// field-verified sw12): applying the raw delta rendered a toed-out stance as
+// pigeon-toed. Conjugating by diag(-1,1,1) maps (x,y,z,w) → (x,-y,-z,w).
+const MIRROR_DELTA_YAW_ROLL = true;
 const COP_COLOR = 0xf59e0b, COMBINED_COP_COLOR = 0x22d3ee;
 const PAD_COLOR = new THREE.Color(0x2ab5a0), PAD_HOT = new THREE.Color(0xf43f5e);
 
@@ -167,20 +171,33 @@ async function boot() {
   function update() {
     for (const side of ["left", "right"]) {
       const fr = feet[side];
-      // heading: rest pose + this foot's yaw (relative insole orientation)
-      const yaw = ((S.footYaw && S.footYaw[side]) || 0) * Math.PI / 180;
-      _q.setFromAxisAngle(_yUp, yaw);
-      fr.group.quaternion.copy(_q).multiply(fr.restQuat);
-      // position: vision foot-track (real relative placement) when on & confident, else fixed stance
+      // Orientation: the foot's FULL relative quaternion (inverse(rest)·live) composed
+      // under the rest pose — the golf widget's field-verified convention
+      // (final = rest · delta). A lone Euler yaw is meaningless near gimbal lock
+      // mid-stride on real insoles and read as erratic. MIRROR_DELTA_YAW_ROLL
+      // carries over the golf widget's device→scene handedness fix (negate y,z:
+      // yaw+roll flip, pitch preserved) so a toed-out foot doesn't render pigeon-toed.
+      const fq = S.footQ && S.footQ[side];
+      if (fq) {
+        _q.set(fq.x, fq.y, fq.z, fq.w);
+        if (_q.lengthSq() < 1e-6) _q.identity();
+        if (MIRROR_DELTA_YAW_ROLL) _q.set(_q.x, -_q.y, -_q.z, _q.w);
+        fr.group.quaternion.copy(fr.restQuat).multiply(_q);
+      } else {
+        fr.group.quaternion.copy(fr.restQuat);
+      }
+      // Position: vision foot-track (real relative placement) when on & confident,
+      // else the fixed stance. Step HEIGHT comes from the insole itself
+      // (S.footLift: unloaded + tilted = foot in the air); vision lift adds to it.
       const fp = S.footPos && S.footPos[side];
-      let liftY = 0;
+      let liftY = (S.footLift && S.footLift[side] ? S.footLift[side] : 0) * POS_SCALE;
       if (S.useVision && fp && fp.c > 0.15) {
         fr.basePos.set(fp.x * POS_SCALE, 0, -fp.z * POS_SCALE);
-        liftY = Math.max(0, fp.y * POS_SCALE);
+        liftY = Math.max(liftY, fp.y * POS_SCALE);
       } else {
         fr.basePos.copy(fr.defaultPos);
       }
-      // ground-clamp so a yawed shoe stays on the grid (plus any vision lift)
+      // ground-clamp so a pitched/yawed shoe rests on the grid (plus any lift)
       let minY = Infinity;
       for (const cor of fr.corners) { _v.copy(cor).applyQuaternion(fr.group.quaternion); if (_v.y < minY) minY = _v.y; }
       fr.group.position.copy(fr.basePos); fr.group.position.y = (Number.isFinite(minY) ? -minY : 0) + liftY;
