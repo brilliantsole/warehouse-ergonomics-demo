@@ -39,7 +39,7 @@
     <label>Sample rate:
       <input type="number" id="fps" value="15" min="2" max="30" step="1" /> fps
       &nbsp; Lateral scale <input type="number" id="wscale" value="1.6" min="0.2" max="4" step="0.1" /> m
-      &nbsp; Height scale <input type="number" id="hscale" value="1.7" min="0.5" max="3" step="0.1" /> m
+      &nbsp; Height scale <input type="number" id="hscale" value="1.0" min="0.5" max="3" step="0.1" /> (lift is already metres; 1.0)
       &nbsp; Depth scale <input type="number" id="zscale" value="1.0" min="0.1" max="5" step="0.1" /> m
     </label>
     <button id="run" disabled>Extract foot-track</button>
@@ -146,12 +146,26 @@ runBtn.addEventListener("click", async () => {
       const hipX = (lm[23].x + lm[24].x) / 2;
       let depthMap = null;
       if (depthWs && depthWs.readyState === 1) { await requestDepth(video); depthMap = depthReady; }
+      // Heel = ground-contact point for lift; ankle for X/Z. A foot is only trustworthy
+      // when its landmarks are INSIDE the frame (out-of-frame feet get extrapolated below
+      // the image and read as metres of lift) → confidence 0 so the app falls back to the
+      // insole estimate. Kept in sync with app.js's in-app extractor.
+      // Per-frame body scale = TORSO (shoulder→hip) — stable through the gait, unlike
+      // hip→heel which shrinks as the heel lifts. Heel height below the hip in torso units.
+      const hipY = (lm[23].y + lm[24].y) / 2;
+      const shoulderY = (lm[11].y + lm[12].y) / 2;
+      const inFrame = (q) => q.x > 0.02 && q.x < 0.98 && q.y > 0.02 && q.y < 0.97;
+      // torso usably in frame? lift needs it (see app.js); per-frame flag, gated per clip
+      const lmVis = (q) => q.visibility ?? 0; // MediaPipe extrapolates cut-off shoulders in-frame; require its confidence too
+      const torsoOk = inFrame(lm[11]) && inFrame(lm[12]) && inFrame(lm[23]) && inFrame(lm[24]) && (hipY - shoulderY) > 0.08
+        && Math.min(lmVis(lm[11]), lmVis(lm[12]), lmVis(lm[23]), lmVis(lm[24])) >= 0.5;
+      const torso = Math.max(0.03, hipY - shoulderY);
       const foot = (ank, heel, toe) => {
-        const a = lm[ank]; if (!a) return null;
-        const nx = (a.x + heel.x) ? a.x : a.x; // ankle as ground point
-        const vis = a.visibility ?? 0.5;
+        const a = lm[ank]; if (!a || !heel) return null;
+        const vis = Math.min(a.visibility ?? 0, heel.visibility ?? 0); // unknown visibility = 0, not 0.5
+        const c = (inFrame(a) && inFrame(heel)) ? vis : 0;
         const zProxy = depthMap ? depthAt(a.x, a.y) : null;
-        return { xn: a.x - hipX, yn: a.y, z: zProxy, vis };
+        return { xn: a.x - hipX, hh: (heel.y - hipY) / torso, z: zProxy, vis: c, torsoOk };
       };
       l = foot(27, lm[29], lm[31]);
       r = foot(28, lm[30], lm[32]);
@@ -162,10 +176,21 @@ runBtn.addEventListener("click", async () => {
     raw.push({ t: Math.round(t * 1000), l, r });
     $("prog").value = t / dur; $("status").textContent = `Extracting… ${(t).toFixed(1)}/${dur.toFixed(1)}s`;
   }
-  // ground baseline = lowest ankle (max normalized y) across the clip → lift 0
-  let groundY = 0; for (const f of raw) for (const s of [f.l, f.r]) if (s && s.yn > groundY) groundY = s.yn;
-  const conv = (s) => s ? { x: +(s.xn * WS).toFixed(3), y: +(Math.max(0, groundY - s.yn) * HS).toFixed(3), z: +(((s.z != null ? s.z : 0) - 0.5) * 2 * ZS).toFixed(3), c: +Math.max(0, Math.min(1, s.vis)).toFixed(2) } : { x: 0, y: 0, z: 0, c: 0 };
-  track = { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose" + (depthWs ? "+depth-anything-v3" : ""), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r) })) };
+  // ground baseline = where the feet USUALLY are on the floor: 90th-percentile ankle-y over
+  // confident frames (the single lowest ankle is fragile — one mis-placed landmark inflates
+  // every lift). Lift clamped to a physical 0–0.35 m. Kept in sync with app.js's in-app extractor.
+  // Floor line per frame = K torso-lengths below the hip (K = this person's planted hip→heel /
+  // torso, calibrated as the 90th-percentile over confident frames). Lift = (K − hh) torso-lengths,
+  // distance-invariant; torso ≈ 0.5 m → metres, clamped 0–0.25. Kept in sync with app.js.
+  // DESIGN DECISION — vision never provides lift (y = 0): step height comes from the insoles.
+  // MediaPipe reports cut-off shoulders at visibility 1.0 and extrapolates them in-frame, so no
+  // gate can tell a real body reference from a hallucinated one. Vision gives X (stance width)
+  // + relative Z. bodyVisible is a diagnostic only. Kept in sync with app.js.
+  const allS = raw.flatMap((f) => [f.l, f.r]).filter(Boolean);
+  const bodyVisible = allS.length ? allS.filter((s) => s.torsoOk).length / allS.length : 0;
+  const conv = (s) => s ? { x: +(s.xn * WS).toFixed(3), y: 0, z: +(((s.z != null ? s.z : 0) - 0.5) * 2 * ZS).toFixed(3), c: +Math.max(0, Math.min(1, s.vis)).toFixed(2) } : { x: 0, y: 0, z: 0, c: 0 };
+  track = { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose" + (depthWs ? "+depth-anything-v3" : ""), bodyVisible: +bodyVisible.toFixed(2), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r) })) };
+  $("status").textContent += ` (upper body in frame ${Math.round(bodyVisible*100)}% of frames — informational; step height always comes from the insoles.)`;
   $("status").textContent = `Done — ${track.frames.length} frames. Download and load it into the demo (syncOffsetMs defaults to 0 — set it if the video started after the sensors).`;
   saveBtn.disabled = false; runBtn.disabled = false;
 });

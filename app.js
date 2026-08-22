@@ -264,13 +264,41 @@
     while (S.footprints.length && t - S.footprints[0].t > MAP.windowMs) S.footprints.shift();
     if (Deriving.on) {
       const ev = { t, x: fx, y: fy, side, n: S.stepSeq, heading: headingDeg, hasVis: false };
-      // bake the real landing position from the vision foot-track (when present) so the
-      // footstep map can show measured step length / sway; est coords are the fallback.
-      const ftf = sampleFootTrack(t);
-      const p = ftf && ftf[side === "left" ? "l" : "r"];
-      if (p && p.c > 0) { ev.xVis = p.x; ev.yVis = -(p.z || 0); ev.hasVis = true; }
+      bakeVisionOntoEvent(ev, h, perp);
       Deriving.footEvents.push(ev);
     }
+  }
+
+  // Vision contributes MEASUREMENTS to the footstep map, not coordinates. Camera
+  // positions are hip-relative (a different frame from the dead-reckoned path), so
+  // substituting them outright put prints in the wrong place and on top of each
+  // other. Instead, a confident vision sample refines THIS step along the insole
+  // heading: the L/R lateral gap gives real stance width, and the forward (Z)
+  // change since the previous foot gives real step length. The path stays
+  // continuous; only its geometry becomes measured. Low-confidence → estimate.
+  const VisBake = { prev: null }; // previous foot's vision sample {side, x, z, t}
+  function bakeVisionOntoEvent(ev, h, perp) {
+    const ftf = sampleFootTrack(ev.t);
+    const p = ftf && ftf[ev.side === "left" ? "l" : "r"];
+    const other = ftf && ftf[ev.side === "left" ? "r" : "l"];
+    if (!(p && p.c >= VISION_MIN_CONF)) { VisBake.prev = null; return; }
+    // stance half-width: half the L/R lateral gap (fallback to the estimate)
+    let lat = MAP.lateralM;
+    if (other && other.c >= VISION_MIN_CONF) lat = Math.max(0.04, Math.min(0.35, Math.abs(p.x - other.x) / 2));
+    // Step length stays the insole estimate. Pose's monocular Z is relative and
+    // compressed (WE 4: measured "strides" of 0.18 m vs a real ~0.6 m), so using
+    // its magnitude shortened the whole path. Vision refines what it measures
+    // well — stance width — and leaves stride to the insoles. (A metric Z from a
+    // depth server or floor calibration could re-enable measured stride here.)
+    const stride = MAP.strideM;
+    const pv = VisBake.prev;
+    // re-place this print along the same heading with measured geometry
+    const base = { x: S.walker.x - Math.sin(h) * MAP.strideM, y: S.walker.y + Math.cos(h) * MAP.strideM }; // walker before this step
+    const wx = base.x + Math.sin(h) * stride, wy = base.y - Math.cos(h) * stride;
+    ev.xVis = wx + Math.cos(h) * lat * perp;
+    ev.yVis = wy + Math.sin(h) * lat * perp;
+    ev.hasVis = true; ev.visStride = +stride.toFixed(3); ev.visLat = +lat.toFixed(3);
+    VisBake.prev = { side: ev.side, x: p.x, z: p.z || 0, t: ev.t };
   }
 
   const mapCtx = $("stepmap").getContext("2d");
@@ -751,6 +779,12 @@
   const videoWrap = () => document.querySelector(".video-wrap");
   let lastReplayMs = 0; // remembered so the vision toggle can re-plot the current moment
 
+  // A vision foot position is only USED above this confidence. Below it (low Pose
+  // visibility, or the foot out of the camera frame → extractor emits 0) the app
+  // falls back to the insole estimate for that moment — a marginal landmark must
+  // never place a footprint or move a shoe.
+  const VISION_MIN_CONF = 0.6;
+
   // Sample the loaded vision foot-track at a recording-clock time. Track frame t
   // is video-relative; align via the track's syncOffsetMs. Returns {left,right}
   // {x,y,z,c} or null. Confidence 0 (or missing foot) means "fall back to insoles".
@@ -763,8 +797,154 @@
     while (lo <= hi) { const m = (lo + hi) >> 1; if (F[m].t <= vt) { idx = m; lo = m + 1; } else hi = m - 1; }
     return F[idx];
   }
+  // ---------- automatic vision foot-track (MediaPipe Pose on the recording's video) ----------
+  // No separate tool: when a recording has a video but no foot-track, Pose runs over
+  // the clip in the background (~10–15 fps sampling) and vision switches on when done.
+  // Gallery recordings ship a pre-baked track so this never runs for them. Output is
+  // the same foot-track/v1 schema the extractor tool produces (it shares this logic).
+  const FootTrackExtractor = {
+    landmarker: null, running: false, cancelled: false,
+    async ensure() {
+      if (this.landmarker) return this.landmarker;
+      const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+      const fileset = await vision.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+      this.landmarker = await vision.PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task" },
+        runningMode: "VIDEO", numPoses: 1,
+      });
+      return this.landmarker;
+    },
+    // Extract a foot-track from a video URL. Runs on a hidden <video> so the visible
+    // player isn't disturbed. onProgress(fraction) is optional.
+    // HS = 1.0: lift is already in metres via TORSO_M (a >1 scale would inflate it).
+    async extract(videoUrl, { fps = 12, WS = 1.6, HS = 1.0, ZS = 1.0, onProgress } = {}) {
+      const lm = await this.ensure();
+      const v = document.createElement("video");
+      v.muted = true; v.playsInline = true; v.preload = "auto"; v.src = videoUrl;
+      await new Promise((res, rej) => { v.onloadedmetadata = () => res(); v.onerror = () => rej(new Error("video failed to load")); });
+      const seek = (t) => new Promise((res) => { v.onseeked = () => res(); v.currentTime = t; });
+      const dur = v.duration, dt = 1 / fps, raw = [];
+      this.running = true; this.cancelled = false;
+      for (let t = 0; t <= dur; t += dt) {
+        if (this.cancelled) { this.running = false; return null; }
+        await seek(t);
+        const res = lm.detectForVideo(v, Math.round(t * 1000));
+        let l = null, r = null;
+        if (res.landmarks && res.landmarks[0]) {
+          const p = res.landmarks[0];
+          const hipX = (p[23].x + p[24].x) / 2;                 // hip-relative X: camera pan doesn't shift both feet
+          // Use the HEEL (29/30) as the ground-contact point for lift (the ankle sits
+          // ~8 cm above the sole and biases lift up); ankle (27/28) for X/Z.
+          // A foot is only trustworthy when its landmarks are INSIDE the frame: when the
+          // wearer walks toward the camera the feet leave the bottom of the image and Pose
+          // extrapolates them below it — those read as metres of "lift". Out-of-frame →
+          // confidence 0, so the app falls back to the insole estimate for that moment.
+          // Per-frame body scale = TORSO length (shoulder→hip, landmarks 11/12 → 23/24).
+          // The wearer's apparent size changes with distance from the camera, so a fixed
+          // image row can't mean "floor". The scale must NOT involve the foot itself:
+          // measuring hip→heel shrinks as the heel lifts and reads the wrong way (a
+          // previous attempt pinned every sample). Torso is stable through the gait.
+          const hipY = (p[23].y + p[24].y) / 2;
+          const shoulderY = (p[11].y + p[12].y) / 2;
+          const inFrame = (q) => q.x > 0.02 && q.x < 0.98 && q.y > 0.02 && q.y < 0.97;
+          // Is the upper body usably in frame? Lift needs a stable vertical body reference
+          // (torso). With a waist-height, close camera the shoulders are cut off or even
+          // BELOW the hips in the image (WE 4: torso measured negative at t=1s) and no
+          // formula can recover height. Record it per frame; lift is gated on it per clip.
+          // Geometry alone is not enough: MediaPipe EXTRAPOLATES cut-off shoulders to plausible
+          // in-frame coordinates, so also require its own confidence in the torso landmarks.
+          const lmVis = (q) => q.visibility ?? 0;
+          const torsoOk = inFrame(p[11]) && inFrame(p[12]) && inFrame(p[23]) && inFrame(p[24]) && (hipY - shoulderY) > 0.08
+            && Math.min(lmVis(p[11]), lmVis(p[12]), lmVis(p[23]), lmVis(p[24])) >= 0.5;
+          const torso = Math.max(0.03, hipY - shoulderY);
+          const foot = (ank, heel) => {
+            const a = p[ank], h = p[heel]; if (!a || !h) return null;
+            // visibility is often UNDEFINED in VIDEO mode — treat unknown as 0, never 0.5
+            // (defaulting to 0.5 let unreliable frames through the confidence gate)
+            const vis = Math.min(a.visibility ?? 0, h.visibility ?? 0);
+            const c = (inFrame(a) && inFrame(h)) ? vis : 0;
+            return { xn: a.x - hipX, hh: (h.y - hipY) / torso, zw: (res.worldLandmarks?.[0]?.[ank]?.z ?? null), vis: c, torsoOk };
+          };
+          l = foot(27, 29); r = foot(28, 30);
+        }
+        raw.push({ t: Math.round(t * 1000), l, r });
+        onProgress?.(Math.min(1, t / dur));
+      }
+      this.running = false;
+      // Ground baseline = where the feet USUALLY are on the floor: the 90th-percentile
+      // ankle-y over confident frames. (The single lowest ankle is fragile — one
+      // mis-placed landmark drags the baseline down and inflates every lift; WE 4
+      // showed 6 m "lifts" that way.) Lift is clamped to a physical 0–0.35 m.
+      // Floor line, per frame, in torso units: a planted heel sits a fixed K torso-lengths
+      // below the hip (K is this person's hip→heel / torso ratio). Calibrate K once as the
+      // 90th-percentile of heel-below-hip over confident frames (feet are mostly planted;
+      // the planted foot is the LOWER one). Lift = (K − hh) torso-lengths, i.e. how far the
+      // heel is above the floor line — distance-invariant. Torso ≈ 0.5 m converts to metres;
+      // clamped to a realistic 0–0.25 m.
+      // DESIGN DECISION — vision never provides lift (y is always 0). Step height comes
+      // from the insoles (an unloaded + tilted foot is in the air), which is verified
+      // physically right (WE 4: 5–7 cm). Monocular Pose cannot give a trustworthy
+      // height here: MediaPipe reports cut-off shoulders at visibility 1.0 and
+      // extrapolates them in-frame, so no geometric or confidence gate separates a
+      // real body reference from a hallucinated one (every attempt pinned lift at the
+      // clamp). Vision contributes what a camera measures well: X (stance width) and
+      // a relative Z. bodyVisible is kept as a diagnostic only.
+      const allS = raw.flatMap((f) => [f.l, f.r]).filter(Boolean);
+      const bodyVisible = allS.length ? allS.filter((s) => s.torsoOk).length / allS.length : 0;
+      // Z from Pose world landmarks (metres, hip-relative, + = away) — monocular, so relative not metric.
+      const conv = (s) => s ? { x: +(s.xn * WS).toFixed(3), y: 0, z: +((s.zw != null ? -s.zw : 0) * ZS).toFixed(3), c: +Math.max(0, Math.min(1, s.vis)).toFixed(2) } : { x: 0, y: 0, z: 0, c: 0 };
+      v.removeAttribute("src"); v.load?.();
+      return { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose (auto, in-app)", bodyVisible: +bodyVisible.toFixed(2), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r) })) };
+    },
+  };
+
+  // Attach a foot-track to the current session AFTER the recording was derived: bake the
+  // real landing positions onto the already-recorded footstep events (so the map gets
+  // them, not just the 3D shoes), then enable the toggle and re-plot.
+  function attachFootTrack(track) {
+    Session.footTrack = track;
+    // Re-bake measured geometry onto the already-recorded events. Events were laid
+    // down by the dead-reckoner, so reconstruct each step's heading/perp and the
+    // walker position at that step from the event itself.
+    VisBake.prev = null;
+    const evs = Session.footEvents;
+    for (let i = 0; i < evs.length; i++) {
+      const ev = evs[i];
+      const h = (ev.heading * Math.PI) / 180, perp = ev.side === "left" ? -1 : 1;
+      // the walker after this step = print minus its lateral offset; temporarily set it so
+      // bakeVisionOntoEvent's "walker before this step" math matches the original derive
+      S.walker.x = ev.x - Math.cos(h) * MAP.lateralM * perp;
+      S.walker.y = ev.y - Math.sin(h) * MAP.lateralM * perp;
+      ev.hasVis = false;
+      bakeVisionOntoEvent(ev, h, perp);
+    }
+    setVisionAvailable(true);
+    if (S.replayActive) applyReplayAt(lastReplayMs);
+  }
+
+  // Kick off background extraction when a session has video but no foot-track.
+  async function autoExtractFootTrack() {
+    if (!Session.video?.url || Session.footTrack || FootTrackExtractor.running) return;
+    const hint = $("vision-hint");
+    try {
+      log("Vision: extracting foot positions from the video (MediaPipe Pose)…");
+      if (hint) hint.textContent = "— extracting from video… 0%";
+      const token = Session.video.url; // abandon the result if the session changes mid-run
+      const track = await FootTrackExtractor.extract(Session.video.url, {
+        onProgress: (f) => { if (hint && Session.video?.url === token) hint.textContent = `— extracting from video… ${Math.round(f * 100)}%`; },
+      });
+      if (!track || Session.video?.url !== token) return;
+      track.video.syncOffsetMs = Session.video.syncOffsetMs || 0; // track time is video-relative; align to the sensor clock
+      attachFootTrack(track);
+      log(`Vision foot-track ready — ${track.frames.length} frames. Toggle on.`);
+    } catch (e) {
+      if (hint) hint.textContent = "— vision unavailable (" + (e.message || "extract failed") + ")";
+      log(`Vision extraction failed: ${e.message}`, "warn");
+    }
+  }
+
   function applyFootPos(fr) {
-    const put = (side, p) => { S.footPos[side] = p && p.c > 0 ? { x: p.x, y: p.y || 0, z: p.z || 0, c: p.c } : { ...S.footPos[side], c: 0 }; };
+    const put = (side, p) => { S.footPos[side] = p && p.c >= VISION_MIN_CONF ? { x: p.x, y: p.y || 0, z: p.z || 0, c: p.c } : { ...S.footPos[side], c: 0 }; };
     put("left", fr && fr.l); put("right", fr && fr.r);
   }
   function setVisionAvailable(avail) {
@@ -1107,6 +1287,7 @@
     setVisionAvailable(!!Session.footTrack);
     setTitle(Session.title);
     enterReplay();
+    if (!Session.footTrack && Session.video) autoExtractFootTrack(); // no foot-track supplied → derive it from the video
   }
 
   // ---------- gallery / URL loading + raw export ----------
@@ -1177,6 +1358,7 @@
       log(`Loaded “${Session.title}” — ${n} frames${Session.video ? " + video" : ""}.`);
       setVisionAvailable(!!Session.footTrack); setExportAvailable(true); setTitle(Session.title);
       enterReplay();
+      if (!Session.footTrack && Session.video) autoExtractFootTrack(); // no pre-baked track → derive it from the video
     } catch (e) { log(`Couldn't load recording: ${e.message}`, "bad"); }
   }
 
@@ -1184,7 +1366,9 @@
     const id = new URLSearchParams(location.search).get("rec");
     if (!id) return;
     try {
-      const man = await fetch("recordings/manifest.json").then((r) => r.ok ? r.json() : null);
+      // no-store: a cached manifest from before a gallery update (e.g. a newly baked
+      // foot-track) would make the app redo a ~20 s extraction on a stale entry
+      const man = await fetch("recordings/manifest.json", { cache: "no-store" }).then((r) => r.ok ? r.json() : null);
       const entry = man && (man.recordings || []).find((e) => e.id === id);
       if (entry) loadRecordingByUrl(entry);
       else log(`Recording “${id}” not found in the gallery.`, "warn");
@@ -1228,7 +1412,7 @@
   };
 
   // expose read-only state for the 3D stance module (stance3d.js, ES module)
-  window.WH = { S, CFG, PAD_NORM };
+  window.WH = { S, CFG, PAD_NORM, Session };
 
   ShoeStage.init();
   setExportAvailable(false);

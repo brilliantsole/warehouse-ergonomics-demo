@@ -187,13 +187,12 @@ async function boot() {
         fr.group.quaternion.copy(fr.restQuat);
       }
       // Position: vision foot-track (real relative placement) when on & confident,
-      // else the fixed stance. Step HEIGHT comes from the insole itself
-      // (S.footLift: unloaded + tilted = foot in the air); vision lift adds to it.
+      // else the fixed stance. Step HEIGHT is insole-only (S.footLift: unloaded +
+      // tilted = foot in the air) — vision never supplies lift; see app.js.
       const fp = S.footPos && S.footPos[side];
-      let liftY = (S.footLift && S.footLift[side] ? S.footLift[side] : 0) * POS_SCALE;
-      if (S.useVision && fp && fp.c > 0.15) {
+      const liftY = (S.footLift && S.footLift[side] ? S.footLift[side] : 0) * POS_SCALE;
+      if (S.useVision && fp && fp.c >= 0.6) {   // matches app.js VISION_MIN_CONF
         fr.basePos.set(fp.x * POS_SCALE, 0, -fp.z * POS_SCALE);
-        liftY = Math.max(liftY, fp.y * POS_SCALE);
       } else {
         fr.basePos.copy(fr.defaultPos);
       }

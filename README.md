@@ -56,28 +56,42 @@ Two recording JSON shapes are accepted:
 Video sync uses `video.syncOffsetMs` from the JSON if present, else 0. (The portal keeps `syncOffsetMs`
 on the video track, not in the JSON export — align with the scrubber if the downloaded clip looks off.)
 
-## Vision foot positions (experimental)
+## Vision foot positions (automatic)
 
-By default the two shoes sit at a **fixed** stance and the footstep map uses an **estimated** stride.
-Load a **foot-track** alongside the recording and toggle **Vision foot positions** to drive real
-relative foot placement instead — feet closer/wider, one forward/back (Z), lift height (Y) — in both
-the 3D stance and the footstep map (real step length / sway). Insoles still provide orientation,
-pressure, COP, and step *timing*; vision provides *where* each foot is. Any low-confidence / occluded
-frame falls back to the insole estimate.
+When a recording has a video, the app runs MediaPipe **Pose** over it **automatically in the
+background** (~20 s for a 47 s clip) and switches **Vision foot positions** on when done — no
+separate tool. Gallery recordings ship a pre-baked `*.foottrack.json` (referenced by `footTrack` in
+the manifest) so they load instantly. `tools/foot-track-extractor.html` still exists for batch /
+offline use (with the optional Depth Anything V3 server for Z) and shares the same logic.
 
-Make a foot-track with **`tools/foot-track-extractor.html`**: open it, load the clip, and it runs
-MediaPipe **Pose** in the browser (X lateral, Y lift) — optionally sampling the **Depth Anything V3**
-server (`ws://localhost:8765`, from the SDK's `examples/depth-anything-v3`) for Z — and downloads a
-`*.foottrack.json`. Load that file together with the recording + video.
+**What vision contributes — a deliberate split.** Each source does what it measures well:
 
-Foot-track schema (`foot-track/v1`): `{ fps, video:{syncOffsetMs}, frames:[{ t, l:{x,y,z,c}, r:{x,y,z,c} }] }`
-— x lateral (m, +right), z forward (m, +away), y lift (m), c confidence 0–1; `t` is video-relative ms.
-`POS_SCALE` in `stance3d.js` maps metres → scene units.
+| | source |
+|---|---|
+| orientation, pressure, COP, step *timing* | insoles |
+| **step length** (stride) | insoles (Pose's monocular Z is relative and compressed) |
+| **step height** | insoles — an unloaded + tilted foot is in the air (WE 4: 5–7 cm, physically right) |
+| **stance width** (L/R lateral gap) | vision — applied along the insole-heading path, so the map stays a continuous walk |
+| relative front/back (Z) | vision, as a soft cue |
 
-**Caveats (prototype):** monocular depth is relative not metric and weakest on Z; a floor calibration
-(homography) would make the top-down map metric; the extractor's per-foot depth samples the server's
-colormapped JPEG as a proxy — extend the server to return raw depth for accuracy. See the extractor
-page's own notes.
+**Vision never supplies lift (Y is always 0 in the track).** This was a hard-won decision from WE 4:
+that clip was shot from waist height, close in — the shoulders were cut off (even *below* the hips
+in the image at times) and the feet left the bottom of the frame whenever the wearer walked toward
+the camera. MediaPipe then *extrapolates* the missing landmarks to plausible in-frame positions and
+reports them at **visibility 1.0**, so no geometric or confidence gate can tell a real body reference
+from a hallucinated one — every height formula tried (fixed floor row, percentile baseline, hip→heel
+scale, torso scale, torso + confidence) pinned lift at its clamp. The insole signal has none of
+these problems. Any foot that is out of frame or below `c ≥ 0.6` (`VISION_MIN_CONF`) falls back to
+the insole estimate for that moment.
+
+For the best vision tracking on future captures: **full body in frame, camera ~1 m high, ~3 m back,
+wearer walking across the view rather than straight at it.**
+
+Foot-track schema (`foot-track/v1`): `{ fps, video:{syncOffsetMs}, bodyVisible, frames:[{ t,
+l:{x,y,z,c}, r:{x,y,z,c} }] }` — x lateral (m, +right), z forward (m, +away, relative not metric),
+y always 0, c confidence 0–1 (MediaPipe's `visibility`, unknown = 0); `t` is video-relative ms;
+`bodyVisible` is an informational fraction of frames with the torso usably in frame. `POS_SCALE` in
+`stance3d.js` maps metres → scene units.
 
 ## Run it
 Serve the folder and open it in Chrome/Edge:
