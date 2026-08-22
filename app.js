@@ -215,9 +215,20 @@
   S.footprints = [];        // {x, y, side, n, t, headingAtStep}
   S.stepSeq = 0;
 
+  // Each footprint is oriented by ITS OWN insole's yaw (gameRotation-derived
+  // S.footYaw), not a shared body heading — so a print faces the way that foot
+  // actually points, and walking backwards / turning reads correctly. The
+  // walker also advances along that foot's yaw. In Simulate, S.footYaw is only
+  // a small toe-out flare, so the simulator's wandering body heading is added.
+  function footHeadingDeg(side) {
+    const yaw = (S.footYaw && S.footYaw[side]) || 0;
+    return S.sim ? S.heading + yaw : yaw;
+  }
+
   function placeFootprint(side, t) {
-    const h = (S.heading * Math.PI) / 180;
-    // advance along heading
+    const headingDeg = footHeadingDeg(side);
+    const h = (headingDeg * Math.PI) / 180;
+    // advance along this foot's heading
     S.walker.x += Math.sin(h) * MAP.strideM;
     S.walker.y -= Math.cos(h) * MAP.strideM;
     // perpendicular offset: left foot to the left of the line of travel
@@ -225,10 +236,10 @@
     const fx = S.walker.x + Math.cos(h) * MAP.lateralM * perp;
     const fy = S.walker.y + Math.sin(h) * MAP.lateralM * perp;
     S.stepSeq++;
-    S.footprints.push({ x: fx, y: fy, side, n: S.stepSeq, t, heading: S.heading });
+    S.footprints.push({ x: fx, y: fy, side, n: S.stepSeq, t, heading: headingDeg });
     while (S.footprints.length && t - S.footprints[0].t > MAP.windowMs) S.footprints.shift();
     if (Deriving.on) {
-      const ev = { t, x: fx, y: fy, side, n: S.stepSeq, heading: S.heading, hasVis: false };
+      const ev = { t, x: fx, y: fy, side, n: S.stepSeq, heading: headingDeg, hasVis: false };
       // bake the real landing position from the vision foot-track (when present) so the
       // footstep map can show measured step length / sway; est coords are the fallback.
       const ftf = sampleFootTrack(t);
@@ -824,6 +835,9 @@
     const frames = []; let lastSnap = -1000; const STEP = 50;
     for (let t = 0; t <= duration; t += STEP) {
       CLOCK = t;
+      // per-foot yaw FIRST so a step detected this tick stamps its print with the current orientation
+      S.footYaw.left = footYawAt(streams.footLgr, gr0.left, t, -11);
+      S.footYaw.right = footYawAt(streams.footRgr, gr0.right, t, 11);
       const sL = sensorObjs(streams.footL, rL, t), sR = sensorObjs(streams.footR, rR, t);
       let loadL = 0.5, loadR = 0.5;
       if (sL) { mapSensorsToPads("left", sL); loadL = sL.reduce((a, b) => a + b.normalizedValue, 0) / (sL.length || 1); }
@@ -837,8 +851,6 @@
       if (streams.torso) { const q = quatOf(at(streams.torso, t)); if (q) onTorsoQuat(q); }
       if (streams.pelvis) { const q = quatOf(at(streams.pelvis, t)); if (q) onPelvisQuat(q); }
       if (streams.torso) S.heading = S.twist;
-      S.footYaw.left = footYawAt(streams.footLgr, gr0.left, t, -11);
-      S.footYaw.right = footYawAt(streams.footRgr, gr0.right, t, 11);
       if (t - lastSnap >= 100) { lastSnap = t; frames.push(snapshotFrame(t)); }
     }
     CLOCK = null; Deriving.on = false; suppressLog = false;
@@ -908,6 +920,9 @@
     };
     for (let t = 0; t <= duration; t += STEP) {
       CLOCK = t;
+      // per-foot yaw FIRST so a step detected this tick stamps its print with the current orientation
+      S.footYaw.left = footYawFrom(GR.footL, gr0.footL, t, -11);
+      S.footYaw.right = footYawFrom(GR.footR, gr0.footR, t, 11);
       const loadL = doFoot("left", "footL"), loadR = doFoot("right", "footR");
       onSideLoad("left", loadL); onSideLoad("right", loadR);
       S.sideLoad.left = loadL; S.sideLoad.right = loadR;
@@ -916,8 +931,6 @@
       const qt = grQuat(nearest(GR.torso, t)); if (qt) onTorsoQuat(qt);
       const qp = grQuat(nearest(GR.pelvis, t)); if (qp) onPelvisQuat(qp);
       if (qt) S.heading = S.twist;
-      S.footYaw.left = footYawFrom(GR.footL, gr0.footL, t, -11);
-      S.footYaw.right = footYawFrom(GR.footR, gr0.footR, t, 11);
       if (t - lastSnap >= 100) { lastSnap = t; frames.push(snapshotFrame(t)); }
     }
     CLOCK = null; Deriving.on = false; suppressLog = false;
