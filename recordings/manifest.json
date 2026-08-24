@@ -1,6 +1,25 @@
 {
  "recordings": [
   {
+   "id": "we6",
+   "title": "WE 6 \u2014 box carries + squat lifts",
+   "date": "2026-08-24",
+   "durationSec": 36,
+   "devices": 4,
+   "sensors": [
+    "pressure",
+    "gameRotation",
+    "linearAcceleration",
+    "rotation"
+   ],
+   "json": "recordings/we6.json",
+   "video": "recordings/we6.mp4",
+   "syncOffsetMs": 2475,
+   "format": "portal",
+   "note": "Insoles + upper-back & pelvis Sense, Warehouse preset, synced webcam. Box carries across the room and squat lifts onto a low stack, with walking toward/away from camera (incl. a backing bout early on). Camera framing good \u2014 bodyVisible 0.91.",
+   "footTrack": "recordings/we6.foottrack.json"
+  },
+  {
    "id": "we5",
    "title": "WE 5 \u2014 box lifts + walking",
    "date": "2026-08-24",
