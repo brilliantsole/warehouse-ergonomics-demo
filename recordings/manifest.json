@@ -1,6 +1,24 @@
 {
  "recordings": [
   {
+   "id": "we5",
+   "title": "WE 5 \u2014 walking session",
+   "date": "2026-08-24",
+   "durationSec": 38,
+   "devices": 4,
+   "sensors": [
+    "pressure",
+    "gameRotation",
+    "linearAcceleration"
+   ],
+   "json": "recordings/we5.json",
+   "video": "recordings/we5.mp4",
+   "syncOffsetMs": 187,
+   "format": "portal",
+   "note": "Insoles + upper-back & pelvis Sense, Warehouse preset, synced webcam. Walking-focused take (no lifts); camera framed per guidance \u2014 bodyVisible 0.94.",
+   "footTrack": "recordings/we5.foottrack.json"
+  },
+  {
    "id": "we4",
    "title": "WE 4 \u2014 walk + lifts (full sensor set)",
    "date": "2026-08-21",
