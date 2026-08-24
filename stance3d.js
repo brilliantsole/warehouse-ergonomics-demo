@@ -26,6 +26,13 @@ const POS_SCALE = 70; // metres → scene units (foot-track positions + insole-d
 // field-verified sw12): applying the raw delta rendered a toed-out stance as
 // pigeon-toed. Conjugating by diag(-1,1,1) maps (x,y,z,w) → (x,-y,-z,w).
 const MIRROR_DELTA_YAW_ROLL = true;
+// Scene sign of the ABSOLUTE mag-north foot heading (S.footNorthDeg, set when a
+// recording carries magnetometer-fused rotation) premultiplied onto the rest pose.
+// MIRROR_DELTA_YAW_ROLL negates delta yaw (mirrored-world convention), so the rest
+// heading premultiplies with the SAME mirrored sign — composed scene yaw stays a
+// consistent mirror of reality: scene heading = −(device heading). Flip if a video
+// comparison ever disagrees.
+const NORTH_SIGN = -1;
 const COP_COLOR = 0xf59e0b, COMBINED_COP_COLOR = 0x22d3ee;
 const PAD_COLOR = new THREE.Color(0x2ab5a0), PAD_HOT = new THREE.Color(0xf43f5e);
 
@@ -37,6 +44,7 @@ const lerp = (a, b, f) => a + (b - a) * f;
 const _color = new THREE.Color();
 const _v = new THREE.Vector3();
 const _q = new THREE.Quaternion();
+const _qN = new THREE.Quaternion();
 const _yUp = new THREE.Vector3(0, 1, 0);
 
 function waitForWH() {
@@ -191,6 +199,14 @@ async function boot() {
       } else {
         fr.group.quaternion.copy(fr.restQuat);
       }
+      // Absolute (true-north) anchor: premultiply this foot's mag rest heading so
+      // composed yaw = north + delta — full X/Y/Z orientation vs true north (golf's
+      // true-north view), per foot and continuous while the wearer walks and turns.
+      const northDeg = (S.footNorthDeg && S.footNorthDeg[side]) || 0;
+      if (northDeg) {
+        _qN.setFromAxisAngle(_yUp, NORTH_SIGN * northDeg * Math.PI / 180);
+        fr.group.quaternion.premultiply(_qN);
+      }
       // Position: vision foot-track (real relative placement) when on & confident,
       // else the fixed stance. Step HEIGHT is insole-only (S.footLift: unloaded +
       // tilted = foot in the air) — vision never supplies lift; see app.js.
@@ -200,6 +216,15 @@ async function boot() {
         fr.basePos.set(fp.x * POS_SCALE, 0, -fp.z * POS_SCALE);
       } else {
         fr.basePos.copy(fr.defaultPos);
+        // No vision this frame: rotate the fixed stance PAIR by the wearer's mean
+        // absolute heading so the whole stance turns with them (like the golf
+        // true-north view rotating base positions; per-foot orbiting would be wrong).
+        if (S.magMap && S.footYaw) {
+          const mL = (S.footYaw.left || 0) * Math.PI / 180, mR = (S.footYaw.right || 0) * Math.PI / 180;
+          const mean = Math.atan2((Math.sin(mL) + Math.sin(mR)) / 2, (Math.cos(mL) + Math.cos(mR)) / 2);
+          _qN.setFromAxisAngle(_yUp, NORTH_SIGN * mean);
+          fr.basePos.applyQuaternion(_qN);
+        }
       }
       // ground-clamp so a pitched/yawed shoe rests on the grid (plus any lift)
       let minY = Infinity;

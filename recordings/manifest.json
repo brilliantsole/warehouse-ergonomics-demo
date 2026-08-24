@@ -28,7 +28,8 @@
    "sensors": [
     "pressure",
     "gameRotation",
-    "linearAcceleration"
+    "linearAcceleration",
+    "rotation"
    ],
    "json": "recordings/we5.json",
    "video": "recordings/we5.mp4",
@@ -47,7 +48,8 @@
     "pressure",
     "gameRotation",
     "linearAcceleration",
-    "stepDetector"
+    "stepDetector",
+    "rotation"
    ],
    "json": "recordings/we4.json",
    "video": "recordings/we4.mp4",

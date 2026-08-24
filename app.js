@@ -41,6 +41,8 @@
     // per-insole FULL relative orientation (inverse(rest)·live, unit quaternion) for the 3D
     // shoes — a lone Euler yaw is meaningless near gimbal lock mid-stride on real insoles
     footQ: { left: { x: 0, y: 0, z: 0, w: 1 }, right: { x: 0, y: 0, z: 0, w: 1 } },
+    footNorthDeg: { left: 0, right: 0 }, // absolute mag rest heading per foot (deg vs north; 0 = no mag data)
+    magMap: false,                        // true when footYaw is magnetometer/true-north referenced
     // per-insole step height (m, ≥0): the foot is in the air when it's UNLOADED and TILTED;
     // derived from the insole alone (no camera needed)
     footLift: { left: 0, right: 0 },
@@ -181,6 +183,37 @@
     if (Math.hypot(v[0], v[2]) < 0.2) return null;       // near-vertical — heading undefined
     return Math.atan2(v[0], v[2]) * 180 / Math.PI;       // 0 at rest by construction
   }
+  // ABSOLUTE compass heading (deg) from a magnetometer-fused `rotation` quaternion:
+  // the sensor's long (X) axis projected onto the ground plane — the golf app's
+  // field-verified magHeadingOf. Robust to the flipped (upside-down) insole board,
+  // whose quaternion yaw-twist is degenerate for a flat foot. Null when the axis
+  // points near-vertical (foot mid-swing); callers hold the last valid heading.
+  // 0° = magnetic north = up the footstep map.
+  function magHeadingDeg(q) {
+    if (!q) return null;
+    const vx = 1 - 2 * (q.y * q.y + q.z * q.z);
+    const vz = 2 * (q.x * q.z - q.w * q.y);
+    if (Math.hypot(vx, vz) < 0.35) return null;
+    return Math.atan2(-vz, vx) * 180 / Math.PI;
+  }
+  const wrap180 = (a) => { while (a > 180) a -= 360; while (a <= -180) a += 360; return a; };
+  // The insoles share one PCB flipped over to make left vs right, so one foot's mag
+  // heading can carry a half-turn mounting offset (golf field 2026-07-28). Feet spend
+  // the session mostly parallel, so when the median right−left heading gap is closer
+  // to a half-turn than to zero, fold the RIGHT foot by 180° (left anchors).
+  function magFoldFor(medL, medR) {
+    if (medL == null || medR == null) return { left: 0, right: 0 };
+    return Math.abs(wrap180(medR - medL)) > 90 ? { left: 0, right: 180 } : { left: 0, right: 0 };
+  }
+  const medianHeading = (hs) => {
+    if (!hs.length) return null;
+    // circular median via unit-vector mean bearing, then median of small residuals
+    let sx = 0, sy = 0;
+    for (const h of hs) { sx += Math.cos(h * Math.PI / 180); sy += Math.sin(h * Math.PI / 180); }
+    const mean = Math.atan2(sy, sx) * 180 / Math.PI;
+    const res = hs.map((h) => wrap180(h - mean)).sort((a, b) => a - b);
+    return wrap180(mean + res[Math.floor(res.length / 2)]);
+  };
 
   function updatePosture() {
     const f = S.flexion;
@@ -463,6 +496,18 @@
       mapCtx.font = "600 9px sans-serif"; mapCtx.textAlign = "center";
       mapCtx.fillText(p.n, x + (p.side === "left" ? -12 : 12), y + 3);
     });
+    if (S.magMap) {
+      // compass rose — this map is true-north referenced (mag-fused insole headings)
+      mapCtx.save();
+      mapCtx.translate(w - 18, 20);
+      mapCtx.strokeStyle = "rgba(238,241,255,.55)"; mapCtx.fillStyle = "rgba(238,241,255,.75)";
+      mapCtx.lineWidth = 1.5;
+      mapCtx.beginPath(); mapCtx.moveTo(0, 8); mapCtx.lineTo(0, -6); mapCtx.stroke();
+      mapCtx.beginPath(); mapCtx.moveTo(-3.5, -3); mapCtx.lineTo(0, -9); mapCtx.lineTo(3.5, -3); mapCtx.closePath(); mapCtx.fill();
+      mapCtx.font = "600 9px sans-serif"; mapCtx.textAlign = "center";
+      mapCtx.fillText("N", 0, 18);
+      mapCtx.restore();
+    }
   }
 
   function onCop(x, y) {
@@ -1091,6 +1136,7 @@
       redTotalMs: 0, redSince: null, copTrail: [], copHistory: [],
       baselineTorso: null, baselinePelvis: null, calSamples: [], pelvisFlexion: null,
       footprints: [], stepSeq: 0, walker: { x: 0, y: 0 }, heading: 0, gaitDir: 1,
+      footNorthDeg: { left: 0, right: 0 }, magMap: false,
       sensors: { left: new Array(8).fill(0), right: new Array(8).fill(0) },
     });
     GaitDir.reset();
@@ -1253,12 +1299,24 @@
     if (!Number.isFinite(t0)) return 0;
 
     // group + sort streams by device
-    const pByDev = {}, grByDev = {};
+    // Split orientation streams BY TYPE. gameRotation (gyro+accel, arbitrary yaw
+    // zero, drift-free deltas) and rotation (magnetometer-fused, true-north yaw)
+    // are DIFFERENT reference frames — mixing them into one nearest()-sampled
+    // stream interleaved quaternions from two frames and rendered as erratic
+    // orientation on WE 6 (the first recording to carry both).
+    const pByDev = {}, grByDev = {}, rotByDev = {};
     for (const r of (exp.pressure || [])) (pByDev[r.device_id] ||= []).push(r);
-    for (const r of (exp.scalar || [])) if (r.sensor_type === "gameRotation" || r.sensor_type === "rotation") (grByDev[r.device_id] ||= []).push(r);
+    for (const r of (exp.scalar || [])) {
+      if (r.sensor_type === "gameRotation") (grByDev[r.device_id] ||= []).push(r);
+      else if (r.sensor_type === "rotation") (rotByDev[r.device_id] ||= []).push(r);
+    }
     const prep = (rows) => (rows || []).map((r) => ({ ...r, t: ms(r.time) - t0 })).sort((a, b) => a.t - b.t);
     const P = { footL: prep(pByDev[ids.footL]), footR: prep(pByDev[ids.footR]) };
-    const GR = { footL: prep(grByDev[ids.footL]), footR: prep(grByDev[ids.footR]), torso: prep(grByDev[ids.torso]), pelvis: prep(grByDev[ids.pelvis]) };
+    const GR = {
+      footL: prep(grByDev[ids.footL]), footR: prep(grByDev[ids.footR]),
+      torso: prep(grByDev[ids.torso] || rotByDev[ids.torso]), pelvis: prep(grByDev[ids.pelvis] || rotByDev[ids.pelvis]),
+    };
+    const ROT = { footL: prep(rotByDev[ids.footL]), footR: prep(rotByDev[ids.footR]) };
     const nearest = (rows, t) => { if (!rows || !rows.length) return null; let lo = 0, hi = rows.length - 1, i = 0; while (lo <= hi) { const m = (lo + hi) >> 1; if (rows[m].t <= t) { i = m; lo = m + 1; } else hi = m - 1; } return rows[i]; };
     const duration = (() => { let d = 1000; for (const s of [P.footL, P.footR, GR.torso, GR.pelvis, GR.footL, GR.footR]) if (s && s.length) d = Math.max(d, s[s.length - 1].t); return d; })();
 
@@ -1266,7 +1324,43 @@
     const grQuat = (r) => (r && r.w != null ? { x: r.x, y: r.y, z: r.z, w: r.w } : null);
     S.baselineTorso = grQuat(nearest(GR.torso, 0)) || eulerToQuat(0, 0, 0);
     S.baselinePelvis = grQuat(nearest(GR.pelvis, 0)) || null;
-    const gr0 = { footL: grQuat(nearest(GR.footL, 0)), footR: grQuat(nearest(GR.footR, 0)) };
+    // Rest instant per foot = first PLANTED pressure sample (load ≥ 0.5) — a first
+    // sample can be mid-walk-in. The gameRotation rest pose and the mag rest heading
+    // are taken at the SAME instant so the 3D composition (north · rest · delta) is
+    // coherent.
+    const restT = (rows) => { for (const r of (rows || [])) if ((r.normalized_sum ?? 0) >= 0.5) return r.t; return 0; };
+    const rT = { footL: restT(P.footL), footR: restT(P.footR) };
+    const gr0 = { footL: grQuat(nearest(GR.footL, rT.footL)), footR: grQuat(nearest(GR.footR, rT.footR)) };
+    // ABSOLUTE per-foot heading from the magnetometer-fused `rotation` stream.
+    // gameRotation's yaw zero is wherever the sensor booted — the median-zero
+    // workaround below pinned every glyph to the wearer's typical direction and
+    // erased real turns. With mag data each foot is INDEPENDENTLY north-referenced
+    // (Jeff's ask); without it (WE 1–5) the median-zero pipeline stays the fallback.
+    // Motion for the 3D shoes still comes from gameRotation deltas — the golf app
+    // field-verified that raw rotation-stream deltas break on the flipped insole
+    // board; mag anchors the statics only (headings + rest yaw).
+    const magHs = { left: [], right: [] };
+    for (const r of ROT.footL) { const h = magHeadingDeg(grQuat(r)); if (h != null) magHs.left.push(h); }
+    for (const r of ROT.footR) { const h = magHeadingDeg(grQuat(r)); if (h != null) magHs.right.push(h); }
+    const magMed = { left: medianHeading(magHs.left), right: medianHeading(magHs.right) };
+    const magFold = magFoldFor(magMed.left, magMed.right);
+    const useMag = { left: magHs.left.length > 20, right: magHs.right.length > 20 };
+    S.magMap = !!(useMag.left || useMag.right);
+    const magHold = {
+      left: { v: magHs.left.length ? wrap180(magHs.left[0] + magFold.left) : -11 },
+      right: { v: magHs.right.length ? wrap180(magHs.right[0] + magFold.right) : 11 },
+    };
+    const magYawAt = (rows, fold, t, hold) => {
+      const h = magHeadingDeg(grQuat(nearest(rows, t)));
+      if (h != null) hold.v = wrap180(h + fold);
+      return hold.v;   // near-vertical mid-swing → hold last valid heading
+    };
+    // North anchor for the 3D stance: each foot's mag heading at its rest instant.
+    S.footNorthDeg = {
+      left: useMag.left ? magYawAt(ROT.footL, magFold.left, rT.footL, { v: magHold.left.v }) : 0,
+      right: useMag.right ? magYawAt(ROT.footR, magFold.right, rT.footR, { v: magHold.right.v }) : 0,
+    };
+    const magLogLine = S.magMap ? `Magnetometer headings live: L median ${magMed.left == null ? "–" : magMed.left.toFixed(0) + "°"}, R median ${magMed.right == null ? "–" : magMed.right.toFixed(0) + "°"}${magFold.right ? " (right board folded 180°)" : ""} — footprints + 3D stance are true-north referenced.` : null;
     // Median-heading zero per foot (see yawZeroOf in the SDK-nested path).
     const yawZeroFrom = (rows, base) => {
       if (!rows || !rows.length || !base) return 0;
@@ -1292,8 +1386,8 @@
     for (let t = 0; t <= duration; t += STEP) {
       CLOCK = t;
       // per-foot yaw FIRST so a step detected this tick stamps its print with the current orientation
-      S.footYaw.left = footYawFrom(GR.footL, gr0.footL, yawZero.left, t, -11);
-      S.footYaw.right = footYawFrom(GR.footR, gr0.footR, yawZero.right, t, 11);
+      S.footYaw.left = useMag.left ? magYawAt(ROT.footL, magFold.left, t, magHold.left) : footYawFrom(GR.footL, gr0.footL, yawZero.left, t, -11);
+      S.footYaw.right = useMag.right ? magYawAt(ROT.footR, magFold.right, t, magHold.right) : footYawFrom(GR.footR, gr0.footR, yawZero.right, t, 11);
       const loadL = doFoot("left", "footL"), loadR = doFoot("right", "footR");
       // full relative orientation + step height per foot (3D shoes)
       updateFootOrientation("left", gr0.footL, grQuat(nearest(GR.footL, t)), loadL);
@@ -1313,6 +1407,7 @@
     Session.frames = frames; Session.footEvents = Deriving.footEvents; Session.durationMs = duration;
     const has = { footL: !!ids.footL, footR: !!ids.footR, torso: !!ids.torso, pelvis: !!ids.pelvis, gameRotation: (GR.torso.length + GR.footL.length + GR.footR.length) > 0 };
     log(`Portal export: feet[${has.footL ? "L" : "–"}${has.footR ? "R" : "–"}] torso:${has.torso ? "y" : "–"} pelvis:${has.pelvis ? "y" : "–"} gameRotation:${has.gameRotation ? "y" : "NO (no posture/heading)"}.`, has.gameRotation ? "" : "warn");
+    if (magLogLine) log(magLogLine);
     return frames.length;
   }
 
