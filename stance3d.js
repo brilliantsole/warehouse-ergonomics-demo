@@ -22,16 +22,20 @@ const PAD_MIRROR_X = { left: 1, right: -1 };
 const SHOE_MODEL_YAW = Math.PI;
 const PAD_RADIUS = 0.7, TRAIL_POINTS = 16;
 const POS_SCALE = 70; // metres → scene units (foot-track positions + insole-derived step height)
-// Device world → scene world is mirrored across the sagittal plane (golf widget,
-// field-verified sw12): applying the raw delta rendered a toed-out stance as
-// pigeon-toed. Conjugating by diag(-1,1,1) maps (x,y,z,w) → (x,-y,-z,w).
-const MIRROR_DELTA_YAW_ROLL = true;
+// Golf mirrors the delta across the sagittal plane (its panel views the stance
+// from BEHIND, a mirrored-world convention). This app's scene is a true
+// from-above world shared with the footstep map, field-calibrated on WE 6's
+// door turn: with the mirror on, the wearer's real clockwise turn rendered
+// counter-clockwise. Raw delta yaw = device yaw = −(map heading), which is
+// exactly the scene's CCW+ convention — so NO mirror here. (Flips roll
+// handedness vs the golf look; foot roll in walking is small.)
+const MIRROR_DELTA_YAW_ROLL = false;
 // Scene sign of the ABSOLUTE mag-north foot heading (S.footNorthDeg, set when a
 // recording carries magnetometer-fused rotation) premultiplied onto the rest pose.
-// MIRROR_DELTA_YAW_ROLL negates delta yaw (mirrored-world convention), so the rest
-// heading premultiplies with the SAME mirrored sign — composed scene yaw stays a
-// consistent mirror of reality: scene heading = −(device heading). Flip if a video
-// comparison ever disagrees.
+// Map heading H is compass-style (CW+ viewed from above); three.js yaw about +Y
+// is CCW+ from above — so scene rest yaw = −H, and the raw (unmirrored) delta
+// supplies Δyaw = −ΔH natively. Composed: scene yaw = −H(t) — one consistent
+// from-above frame shared with the footstep map.
 const NORTH_SIGN = -1;
 const COP_COLOR = 0xf59e0b, COMBINED_COP_COLOR = 0x22d3ee;
 const PAD_COLOR = new THREE.Color(0x2ab5a0), PAD_HOT = new THREE.Color(0xf43f5e);
@@ -182,6 +186,40 @@ async function boot() {
     // the shoes crossed/overlapping.
     const fpL = S.footPos && S.footPos.left, fpR = S.footPos && S.footPos.right;
     const visCrossed = !!(fpL && fpR && fpL.c >= 0.6 && fpR.c >= 0.6 && fpL.x > fpR.x);
+    // Position pre-pass: vision placement when confident, else the fixed stance
+    // rotated by the wearer's mean absolute heading (the pair turns together —
+    // per-foot orbiting would be wrong). Then a minimum-separation guard:
+    // monocular Z compresses fore-aft distance, so mid-stride pass-throughs
+    // rendered both shoes stacked on one spot — enforce ~a shoe width apart
+    // along their (vision-derived) separation line, midpoint preserved.
+    for (const side of ["left", "right"]) {
+      const fr = feet[side];
+      const fp = S.footPos && S.footPos[side];
+      if (S.useVision && fp && fp.c >= 0.6 && !visCrossed) {   // matches app.js VISION_MIN_CONF
+        fr.basePos.set(fp.x * POS_SCALE, 0, -fp.z * POS_SCALE);
+      } else {
+        fr.basePos.copy(fr.defaultPos);
+        if (S.magMap && S.footYaw) {
+          const mL = (S.footYaw.left || 0) * Math.PI / 180, mR = (S.footYaw.right || 0) * Math.PI / 180;
+          const mean = Math.atan2((Math.sin(mL) + Math.sin(mR)) / 2, (Math.cos(mL) + Math.cos(mR)) / 2);
+          _qN.setFromAxisAngle(_yUp, NORTH_SIGN * mean);
+          fr.basePos.applyQuaternion(_qN);
+        }
+      }
+    }
+    {
+      const bl = feet.left.basePos, br = feet.right.basePos;
+      const dx = br.x - bl.x, dz = br.z - bl.z, d = Math.hypot(dx, dz);
+      // Floor on the SHOE LENGTH, not width: mid-stride the separation line runs
+      // fore-aft along the shoes, where a width-sized gap still overlaps them.
+      const minSep = ((feet.left.bedLength + feet.right.bedLength) / BED_LENGTH_FRAC / 2) * 0.85;
+      if (d < minSep) {
+        const ux = d > 1e-3 ? dx / d : 1, uz = d > 1e-3 ? dz / d : 0;
+        const push = (minSep - d) / 2;
+        bl.x -= ux * push; bl.z -= uz * push;
+        br.x += ux * push; br.z += uz * push;
+      }
+    }
     for (const side of ["left", "right"]) {
       const fr = feet[side];
       // Orientation: the foot's FULL relative quaternion (inverse(rest)·live) composed
@@ -207,25 +245,10 @@ async function boot() {
         _qN.setFromAxisAngle(_yUp, NORTH_SIGN * northDeg * Math.PI / 180);
         fr.group.quaternion.premultiply(_qN);
       }
-      // Position: vision foot-track (real relative placement) when on & confident,
-      // else the fixed stance. Step HEIGHT is insole-only (S.footLift: unloaded +
-      // tilted = foot in the air) — vision never supplies lift; see app.js.
-      const fp = S.footPos && S.footPos[side];
+      // Position comes from the pre-pass above (vision / rotated stance + minimum
+      // separation). Step HEIGHT is insole-only (S.footLift: unloaded + tilted =
+      // foot in the air) — vision never supplies lift; see app.js.
       const liftY = (S.footLift && S.footLift[side] ? S.footLift[side] : 0) * POS_SCALE;
-      if (S.useVision && fp && fp.c >= 0.6 && !visCrossed) {   // matches app.js VISION_MIN_CONF
-        fr.basePos.set(fp.x * POS_SCALE, 0, -fp.z * POS_SCALE);
-      } else {
-        fr.basePos.copy(fr.defaultPos);
-        // No vision this frame: rotate the fixed stance PAIR by the wearer's mean
-        // absolute heading so the whole stance turns with them (like the golf
-        // true-north view rotating base positions; per-foot orbiting would be wrong).
-        if (S.magMap && S.footYaw) {
-          const mL = (S.footYaw.left || 0) * Math.PI / 180, mR = (S.footYaw.right || 0) * Math.PI / 180;
-          const mean = Math.atan2((Math.sin(mL) + Math.sin(mR)) / 2, (Math.cos(mL) + Math.cos(mR)) / 2);
-          _qN.setFromAxisAngle(_yUp, NORTH_SIGN * mean);
-          fr.basePos.applyQuaternion(_qN);
-        }
-      }
       // ground-clamp so a pitched/yawed shoe rests on the grid (plus any lift)
       let minY = Infinity;
       for (const cor of fr.corners) { _v.copy(cor).applyQuaternion(fr.group.quaternion); if (_v.y < minY) minY = _v.y; }

@@ -194,7 +194,13 @@
     const vx = 1 - 2 * (q.y * q.y + q.z * q.z);
     const vz = 2 * (q.x * q.z - q.w * q.y);
     if (Math.hypot(vx, vz) < 0.35) return null;
-    return Math.atan2(-vz, vx) * 180 / Math.PI;
+    // atan2(vz, vx) — NOT golf's atan2(−vz, vx). Field-calibrated on WE 6's door
+    // turn (video t6.5→9.0): the wearer turns clockwise viewed from above
+    // (facing camera → facing frame-left), so map heading must INCREASE
+    // (N→E→S→W screen convention); the golf sign rendered every real turn
+    // mirrored. Golf only used the heading for symmetric relative flare, where
+    // the mirror cancels — an absolute map exposes it.
+    return Math.atan2(vz, vx) * 180 / Math.PI;
   }
   const wrap180 = (a) => { while (a > 180) a -= 360; while (a <= -180) a += 360; return a; };
   // The insoles share one PCB flipped over to make left vs right, so one foot's mag
@@ -372,30 +378,52 @@
     const w = { x: 0, y: 0 };
     for (const ev of evs) {
       const dir = GaitDir.dirAt(ev.t);
-      const h = (ev.heading * Math.PI) / 180;
+      // Same rules as placeFootprint: path advances along the BODY heading (ev.adv),
+      // and only when the step was genuine gait (ev.walk) — weight shifts stay put.
+      const h = ((ev.adv != null ? ev.adv : ev.heading) * Math.PI) / 180;
+      const stride = (ev.walk != null && !ev.walk) ? 0 : MAP.strideM;
       const perp = ev.side === "left" ? -1 : 1;
       const base = { x: w.x, y: w.y };
-      w.x += Math.sin(h) * MAP.strideM * dir;
-      w.y -= Math.cos(h) * MAP.strideM * dir;
+      w.x += Math.sin(h) * stride * dir;
+      w.y -= Math.cos(h) * stride * dir;
       ev.x = w.x + Math.cos(h) * MAP.lateralM * perp;
       ev.y = w.y + Math.sin(h) * MAP.lateralM * perp;
       if (ev.hasVis) {
-        const stride = ev.visStride || MAP.strideM, lat = ev.visLat || MAP.lateralM;
-        const vx = base.x + Math.sin(h) * stride * dir, vy = base.y - Math.cos(h) * stride * dir;
+        const vstride = stride ? (ev.visStride || MAP.strideM) : 0, lat = ev.visLat || MAP.lateralM;
+        const vx = base.x + Math.sin(h) * vstride * dir, vy = base.y - Math.cos(h) * vstride * dir;
         ev.xVis = vx + Math.cos(h) * lat * perp;
         ev.yVis = vy + Math.sin(h) * lat * perp;
       }
     }
   }
 
+  // Advance the walker only during GENUINE gait: a real stride alternates feet
+  // within a beat. Load-shift "steps" (threshold re-crossings while standing,
+  // lifting, or pivoting) used to march the walker a full stride each — a
+  // stationary lift sequence walked clear across the map (WE 6 field report:
+  // "way off from reality"). A step whose opposite foot hasn't stepped recently
+  // places its print in place (weight shift), stride 0.
+  const GAIT_ALTERNATION_MS = 1600;
+  function circMeanDeg(a, b) {
+    const ar = a * Math.PI / 180, br = b * Math.PI / 180;
+    return Math.atan2((Math.sin(ar) + Math.sin(br)) / 2, (Math.cos(ar) + Math.cos(br)) / 2) * 180 / Math.PI;
+  }
   function placeFootprint(side, t) {
     const headingDeg = footHeadingDeg(side);
-    const h = (headingDeg * Math.PI) / 180;
-    // advance along this foot's heading — REVERSED when walking backward (the glyph
-    // keeps facing the way the foot points; only the path direction flips)
+    // The PATH advances along the BODY direction (circular mean of both feet) —
+    // advancing along each stepping foot's own splayed heading sawtoothed the path
+    // by the full L/R flare every step. Each GLYPH still faces its own insole's
+    // heading. (Mag recordings only; fallback/sim keep the original behavior.)
+    const other = side === "left" ? "right" : "left";
+    const advDeg = S.magMap ? circMeanDeg(footHeadingDeg(side), footHeadingDeg(other)) : headingDeg;
+    const h = (advDeg * Math.PI) / 180;
+    // REVERSED when walking backward (the glyph keeps facing the way the foot
+    // points; only the path direction flips)
     const dir = S.gaitDir || 1;
-    S.walker.x += Math.sin(h) * MAP.strideM * dir;
-    S.walker.y -= Math.cos(h) * MAP.strideM * dir;
+    const walking = (t - (S.lastStepAt[other] || 0)) <= GAIT_ALTERNATION_MS;
+    const stride = walking ? MAP.strideM : 0;
+    S.walker.x += Math.sin(h) * stride * dir;
+    S.walker.y -= Math.cos(h) * stride * dir;
     // perpendicular offset: left foot to the left of the line of travel
     const perp = side === "left" ? -1 : 1;
     const fx = S.walker.x + Math.cos(h) * MAP.lateralM * perp;
@@ -404,8 +432,8 @@
     S.footprints.push({ x: fx, y: fy, side, n: S.stepSeq, t, heading: headingDeg });
     while (S.footprints.length && t - S.footprints[0].t > MAP.windowMs) S.footprints.shift();
     if (Deriving.on) {
-      const ev = { t, x: fx, y: fy, side, n: S.stepSeq, heading: headingDeg, hasVis: false };
-      bakeVisionOntoEvent(ev, h, perp);
+      const ev = { t, x: fx, y: fy, side, n: S.stepSeq, heading: headingDeg, adv: +advDeg.toFixed(1), walk: walking ? 1 : 0, hasVis: false };
+      bakeVisionOntoEvent(ev, h, perp, stride);
       Deriving.footEvents.push(ev);
     }
   }
@@ -418,7 +446,7 @@
   // change since the previous foot gives real step length. The path stays
   // continuous; only its geometry becomes measured. Low-confidence → estimate.
   const VisBake = { prev: null }; // previous foot's vision sample {side, x, z, t}
-  function bakeVisionOntoEvent(ev, h, perp) {
+  function bakeVisionOntoEvent(ev, h, perp, strideUsed) {
     const ftf = sampleFootTrack(ev.t);
     const p = ftf && ftf[ev.side === "left" ? "l" : "r"];
     const other = ftf && ftf[ev.side === "left" ? "r" : "l"];
@@ -426,16 +454,16 @@
     // stance half-width: half the L/R lateral gap (fallback to the estimate)
     let lat = MAP.lateralM;
     if (other && other.c >= VISION_MIN_CONF) lat = Math.max(0.04, Math.min(0.35, Math.abs(p.x - other.x) / 2));
-    // Step length stays the insole estimate. Pose's monocular Z is relative and
-    // compressed (WE 4: measured "strides" of 0.18 m vs a real ~0.6 m), so using
-    // its magnitude shortened the whole path. Vision refines what it measures
-    // well — stance width — and leaves stride to the insoles. (A metric Z from a
-    // depth server or floor calibration could re-enable measured stride here.)
-    const stride = MAP.strideM;
+    // Step length stays the insole estimate — zero when this step was a weight
+    // shift, not a stride (see placeFootprint's gait gate). Pose's monocular Z is
+    // relative and compressed (WE 4: measured "strides" of 0.18 m vs a real
+    // ~0.6 m), so using its magnitude shortened the whole path. Vision refines
+    // what it measures well — stance width — and leaves stride to the insoles.
+    const stride = strideUsed;
     const pv = VisBake.prev;
     // re-place this print along the same heading with measured geometry (direction-aware)
     const dir = S.gaitDir || 1;
-    const base = { x: S.walker.x - Math.sin(h) * MAP.strideM * dir, y: S.walker.y + Math.cos(h) * MAP.strideM * dir }; // walker before this step
+    const base = { x: S.walker.x - Math.sin(h) * strideUsed * dir, y: S.walker.y + Math.cos(h) * strideUsed * dir }; // walker before this step
     const wx = base.x + Math.sin(h) * stride * dir, wy = base.y - Math.cos(h) * stride * dir;
     ev.xVis = wx + Math.cos(h) * lat * perp;
     ev.yVis = wy + Math.sin(h) * lat * perp;
