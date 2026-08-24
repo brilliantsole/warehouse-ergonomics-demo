@@ -163,7 +163,7 @@ runBtn.addEventListener("click", async () => {
       // Facing sign + profile gate (see app.js): body-side landmarks mirror when facing
       // the camera; in profile the lateral gap is meaningless. Kept in sync with app.js.
       const shDx = lm[11].x - lm[12].x;                // shoulders, not hips — see app.js
-      const facingKnown = Math.abs(shDx) / torso >= 0.15;
+      const facingKnown = inFrame(lm[11]) && inFrame(lm[12]) && Math.abs(shDx) / torso >= 0.15;
       const faceSign = shDx > 0 ? -1 : 1;
       const foot = (ank, heel, toe) => {
         const a = lm[ank]; if (!a || !heel) return null;

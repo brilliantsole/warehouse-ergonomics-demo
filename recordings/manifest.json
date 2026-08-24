@@ -2,7 +2,7 @@
  "recordings": [
   {
    "id": "we5",
-   "title": "WE 5 \u2014 walking session",
+   "title": "WE 5 \u2014 box lifts + walking",
    "date": "2026-08-24",
    "durationSec": 38,
    "devices": 4,
@@ -15,7 +15,7 @@
    "video": "recordings/we5.mp4",
    "syncOffsetMs": 187,
    "format": "portal",
-   "note": "Insoles + upper-back & pelvis Sense, Warehouse preset, synced webcam. Walking-focused take (no lifts); camera framed per guidance \u2014 bodyVisible 0.94.",
+   "note": "Insoles + upper-back & pelvis Sense, Warehouse preset, synced webcam. Includes backing-up and box lifts (squat/hip-dominant \u2014 trunk stayed under the 45\u00b0 stoop threshold, so the lift counter reads 0; posture gauge still tracks). Camera framed per guidance \u2014 bodyVisible 0.94.",
    "footTrack": "recordings/we5.foottrack.json"
   },
   {

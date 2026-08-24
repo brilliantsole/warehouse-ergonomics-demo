@@ -37,6 +37,7 @@
     cop: { x: 0.5, y: 0.5 }, copTrail: [], copHistory: [],
     copFoot: { left: { x: 0.5, y: 0.5 }, right: { x: 0.5, y: 0.5 } }, // per-insole COP
     footYaw: { left: -10, right: 10 }, // per-insole heading (deg) — used by the footstep map
+    gaitDir: 1, // +1 walking forward, −1 walking BACKWARD (feet still point forward; the path grows the other way)
     // per-insole FULL relative orientation (inverse(rest)·live, unit quaternion) for the 3D
     // shoes — a lone Euler yaw is meaningless near gimbal lock mid-stride on real insoles
     footQ: { left: { x: 0, y: 0, z: 0, w: 1 }, right: { x: 0, y: 0, z: 0, w: 1 } },
@@ -262,12 +263,106 @@
     return S.sim ? S.heading + yaw : yaw;
   }
 
+  // Walking DIRECTION (forward vs backward): when you walk backwards your feet still
+  // point forward, so foot orientation can't tell — but the path must grow the other
+  // way. Classified per completed stance from two signals with hysteresis:
+  //  • COP roll: forward stance rolls heel→toe (portal normalized_center_y rises,
+  //    0=heel 1=toe — calibrated on WE 5); backward rolls toe→heel (falls).
+  //  • Vision body-scale: facing the camera (track f=+1) with torso size SHRINKING
+  //    ⇒ moving away while facing ⇒ backward. Strongest exactly where the COP cue
+  //    is weakest (WE 5's backing-up bout faces the camera). Weighted 1.5×.
+  // Direction flips only on a decisive score; otherwise the last direction holds.
+  const GaitDir = {
+    st: { left: null, right: null },
+    decisions: [],   // {t, dir} — every DECISIVE classification (holds are not recorded)
+    reset() { this.st.left = null; this.st.right = null; this.decisions = []; S.gaitDir = 1; },
+    // Direction at time t with hindsight: nearest decision at-or-before t; steps before
+    // the FIRST decision inherit it (a bout's direction is uniform, and the classifier
+    // needs a completed stance + decisive evidence before it can speak — without
+    // backfill the first steps of a session that starts backward draw forward).
+    // Debounced timeline: a direction (including the very first anchor) only counts
+    // when TWO consecutive decisions agree — every observed misclassification on real
+    // data was an isolated single decision (a lone cop=+1 stance mid-backing-bout,
+    // lone flips during stationary lifting weight-shifts).
+    effective() {
+      const d = this.decisions, eff = [];
+      let cur = null;
+      for (let i = 0; i < d.length; i++) {
+        if (d[i].dir === cur) continue;
+        if (i + 1 < d.length && d[i + 1].dir === d[i].dir) { cur = d[i].dir; eff.push({ t: d[i].t, dir: cur }); }
+      }
+      return eff;
+    },
+    dirAt(t) {
+      const d = this.effective();
+      if (!d.length) return 1;
+      if (t < d[0].t) return d[0].dir;
+      let cur = d[0].dir;
+      for (const x of d) { if (x.t <= t) cur = x.dir; else break; }
+      return cur;
+    },
+    tick(side, load, copY, t) {
+      const st = this.st[side];
+      if (load >= 0.5) {
+        if (!st) this.st[side] = { ys: [{ t, y: copY }] };
+        else st.ys.push({ t, y: copY });
+      } else if (st) {
+        this.st[side] = null;
+        const ys = st.ys;
+        if (ys.length < 4 || (ys[ys.length - 1].t - ys[0].t) < 200) return;
+        let n = ys.length, sx = 0, sy = 0, sxy = 0, sxx = 0;
+        for (const p of ys) { const x = (p.t - ys[0].t) / 1000; sx += x; sy += p.y; sxy += x * p.y; sxx += x * x; }
+        const den = n * sxx - sx * sx;
+        const slope = den > 1e-6 ? (n * sxy - sx * sy) / den : 0;   // copY per second
+        let visScore = 0;
+        const f0 = sampleFootTrack(ys[0].t), f1 = sampleFootTrack(ys[ys.length - 1].t);
+        if (f0 && f1 && f0.bs && f1.bs && f0.f && f0.f === f1.f) {
+          const growth = (f1.bs - f0.bs) / Math.max(f0.bs, 1e-3);   // shoulder-width change over the stance
+          // 5% deadband: a stationary wearer's width wobbles a few percent (lean/turn) —
+          // that must not cast direction votes. Real near-camera walking moves 10–25%/stance.
+          visScore = Math.abs(growth) < 0.05 ? 0 : Math.max(-1, Math.min(1, growth * 8)) * f0.f;
+        }
+        const copScore = Math.max(-1, Math.min(1, slope * 2));
+        const score = copScore + 1.5 * visScore;
+        if (score > 0.35) { S.gaitDir = 1; this.decisions.push({ t, dir: 1, side, cop: +copScore.toFixed(2), vis: +visScore.toFixed(2) }); }
+        else if (score < -0.35) { S.gaitDir = -1; this.decisions.push({ t, dir: -1, side, cop: +copScore.toFixed(2), vis: +visScore.toFixed(2) }); }
+      }
+    },
+  };
+
+  // After an offline derive, re-lay the footstep path using the FULL direction
+  // timeline (incl. backfill before the first decision). Walker advance replicates
+  // placeFootprint (estimated stride); vision events re-place their print with the
+  // measured geometry from the same walker base, exactly as bakeVisionOntoEvent did.
+  function rebuildFootEventPositions(evs) {
+    if (!GaitDir.effective().length || !evs.length) return;
+    const w = { x: 0, y: 0 };
+    for (const ev of evs) {
+      const dir = GaitDir.dirAt(ev.t);
+      const h = (ev.heading * Math.PI) / 180;
+      const perp = ev.side === "left" ? -1 : 1;
+      const base = { x: w.x, y: w.y };
+      w.x += Math.sin(h) * MAP.strideM * dir;
+      w.y -= Math.cos(h) * MAP.strideM * dir;
+      ev.x = w.x + Math.cos(h) * MAP.lateralM * perp;
+      ev.y = w.y + Math.sin(h) * MAP.lateralM * perp;
+      if (ev.hasVis) {
+        const stride = ev.visStride || MAP.strideM, lat = ev.visLat || MAP.lateralM;
+        const vx = base.x + Math.sin(h) * stride * dir, vy = base.y - Math.cos(h) * stride * dir;
+        ev.xVis = vx + Math.cos(h) * lat * perp;
+        ev.yVis = vy + Math.sin(h) * lat * perp;
+      }
+    }
+  }
+
   function placeFootprint(side, t) {
     const headingDeg = footHeadingDeg(side);
     const h = (headingDeg * Math.PI) / 180;
-    // advance along this foot's heading
-    S.walker.x += Math.sin(h) * MAP.strideM;
-    S.walker.y -= Math.cos(h) * MAP.strideM;
+    // advance along this foot's heading — REVERSED when walking backward (the glyph
+    // keeps facing the way the foot points; only the path direction flips)
+    const dir = S.gaitDir || 1;
+    S.walker.x += Math.sin(h) * MAP.strideM * dir;
+    S.walker.y -= Math.cos(h) * MAP.strideM * dir;
     // perpendicular offset: left foot to the left of the line of travel
     const perp = side === "left" ? -1 : 1;
     const fx = S.walker.x + Math.cos(h) * MAP.lateralM * perp;
@@ -305,9 +400,10 @@
     // depth server or floor calibration could re-enable measured stride here.)
     const stride = MAP.strideM;
     const pv = VisBake.prev;
-    // re-place this print along the same heading with measured geometry
-    const base = { x: S.walker.x - Math.sin(h) * MAP.strideM, y: S.walker.y + Math.cos(h) * MAP.strideM }; // walker before this step
-    const wx = base.x + Math.sin(h) * stride, wy = base.y - Math.cos(h) * stride;
+    // re-place this print along the same heading with measured geometry (direction-aware)
+    const dir = S.gaitDir || 1;
+    const base = { x: S.walker.x - Math.sin(h) * MAP.strideM * dir, y: S.walker.y + Math.cos(h) * MAP.strideM * dir }; // walker before this step
+    const wx = base.x + Math.sin(h) * stride * dir, wy = base.y - Math.cos(h) * stride * dir;
     ev.xVis = wx + Math.cos(h) * lat * perp;
     ev.yVis = wy + Math.sin(h) * lat * perp;
     ev.hasVis = true; ev.visStride = +stride.toFixed(3); ev.visLat = +lat.toFixed(3);
@@ -602,7 +698,11 @@
     }));
   }
   // Identity for the 8-sensor insole; flip entries here if hardware order differs.
-  const SDK_SENSOR_TO_PAD = [0, 1, 2, 3, 4, 5, 6, 7];
+  // FIELD-CALIBRATED on WE 5 (2026-08-24): at known FORWARD landings sensor idx 7
+  // loads first (0.99/0.71/0.8/0.91 at onset) — forward walking lands HEEL-first,
+  // so the SDK's sensor order runs TOE→HEEL. Reverse it onto the anatomical pads
+  // (pad 0 = heel … 7 = hallux). The identity map painted heel pressure on the toe.
+  const SDK_SENSOR_TO_PAD = [7, 6, 5, 4, 3, 2, 1, 0];
 
   // Fill S.sensors[side] (8 artwork pads) from a live per-sensor array of any length.
   function mapSensorsToPads(side, sensors) {
@@ -842,7 +942,7 @@
         if (this.cancelled) { this.running = false; return null; }
         await seek(t);
         const res = lm.detectForVideo(v, Math.round(t * 1000));
-        let l = null, r = null;
+        let l = null, r = null, bs = null, fc = 0;
         if (res.landmarks && res.landmarks[0]) {
           const p = res.landmarks[0];
           const hipX = (p[23].x + p[24].x) / 2;                 // hip-relative X: camera pan doesn't shift both feet
@@ -881,8 +981,15 @@
           // the image's right ⇔ facing camera ⇒ mirror body-side x. Width < 0.15 ⇒
           // profile/turned ⇒ sign unreliable ⇒ confidence 0.
           const shDx = p[11].x - p[12].x;                  // left shoulder − right shoulder, image x
-          const facingKnown = Math.abs(shDx) / torso >= 0.15;
+          // Facing requires the shoulders IN FRAME: an out-of-frame shoulder is extrapolated.
+          const facingKnown = inFrame(p[11]) && inFrame(p[12]) && Math.abs(shDx) / torso >= 0.15;
           const faceSign = shDx > 0 ? -1 : 1;              // toward camera ⇒ mirror
+          // Body scale for the gait-direction cue = SHOULDER WIDTH, not torso height:
+          // torso height falsely GROWS as a cropped torso comes into frame (WE 5's
+          // backing bout started chest-cropped → vis voted "approaching") and falsely
+          // SHRINKS when bending to lift. Shoulder width has neither failure mode.
+          bs = +Math.abs(shDx).toFixed(4);
+          fc = facingKnown ? (shDx > 0 ? 1 : -1) : 0;      // +1 facing camera, −1 away, 0 profile/cropped
           const foot = (ank, heel) => {
             const a = p[ank], h = p[heel]; if (!a || !h) return null;
             // visibility is often UNDEFINED in VIDEO mode — treat unknown as 0, never 0.5
@@ -893,7 +1000,7 @@
           };
           l = foot(27, 29); r = foot(28, 30);
         }
-        raw.push({ t: Math.round(t * 1000), l, r });
+        raw.push({ t: Math.round(t * 1000), l, r, bs, f: fc });
         onProgress?.(Math.min(1, t / dur));
       }
       this.running = false;
@@ -920,7 +1027,7 @@
       // Z from Pose world landmarks (metres, hip-relative, + = away) — monocular, so relative not metric.
       const conv = (s) => s ? { x: +(s.xn * WS).toFixed(3), y: 0, z: +((s.zw != null ? -s.zw : 0) * ZS).toFixed(3), c: +Math.max(0, Math.min(1, s.vis)).toFixed(2) } : { x: 0, y: 0, z: 0, c: 0 };
       v.removeAttribute("src"); v.load?.();
-      return { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose (auto, in-app)", bodyVisible: +bodyVisible.toFixed(2), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r) })) };
+      return { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose (auto, in-app)", bodyVisible: +bodyVisible.toFixed(2), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r), bs: f.bs, f: f.f })) };
     },
   };
 
@@ -929,20 +1036,12 @@
   // them, not just the 3D shoes), then enable the toggle and re-plot.
   function attachFootTrack(track) {
     Session.footTrack = track;
-    // Re-bake measured geometry onto the already-recorded events. Events were laid
-    // down by the dead-reckoner, so reconstruct each step's heading/perp and the
-    // walker position at that step from the event itself.
-    VisBake.prev = null;
-    const evs = Session.footEvents;
-    for (let i = 0; i < evs.length; i++) {
-      const ev = evs[i];
-      const h = (ev.heading * Math.PI) / 180, perp = ev.side === "left" ? -1 : 1;
-      // the walker after this step = print minus its lateral offset; temporarily set it so
-      // bakeVisionOntoEvent's "walker before this step" math matches the original derive
-      S.walker.x = ev.x - Math.cos(h) * MAP.lateralM * perp;
-      S.walker.y = ev.y - Math.sin(h) * MAP.lateralM * perp;
-      ev.hasVis = false;
-      bakeVisionOntoEvent(ev, h, perp);
+    // Re-DERIVE the whole recording with the track present: gait direction (vision
+    // body-scale cue) and measured stance width inform the walk as it is laid down —
+    // a post-hoc re-bake can't retroactively flip the path of a backward bout.
+    if (Session.raw) {
+      const n = Session.rawFormat === "portal" ? deriveFromPortalExport(Session.raw) : deriveFromRecording(Session.raw);
+      if (!n) return;
     }
     setVisionAvailable(true);
     if (S.replayActive) applyReplayAt(lastReplayMs);
@@ -991,9 +1090,10 @@
       lifts: 0, liftsGood: 0, liftsBad: 0, inLift: false, liftPeak: 0, liftPeakDelta: 0,
       redTotalMs: 0, redSince: null, copTrail: [], copHistory: [],
       baselineTorso: null, baselinePelvis: null, calSamples: [], pelvisFlexion: null,
-      footprints: [], stepSeq: 0, walker: { x: 0, y: 0 }, heading: 0,
+      footprints: [], stepSeq: 0, walker: { x: 0, y: 0 }, heading: 0, gaitDir: 1,
       sensors: { left: new Array(8).fill(0), right: new Array(8).fill(0) },
     });
+    GaitDir.reset();
   }
 
   function snapshotFrame(tms) {
@@ -1102,6 +1202,7 @@
       // full relative orientation + step height per foot (3D shoes)
       updateFootOrientation("left", gr0.left, quatOf(at(streams.footLgr, t)), loadL);
       updateFootOrientation("right", gr0.right, quatOf(at(streams.footRgr, t)), loadR);
+      GaitDir.tick("left", loadL, S.copFoot.left.y, t); GaitDir.tick("right", loadR, S.copFoot.right.y, t);
       onSideLoad("left", loadL); onSideLoad("right", loadR);
       S.sideLoad.left = loadL; S.sideLoad.right = loadR;
       const fcL = footCopFromSensors("left"), fcR = footCopFromSensors("right");
@@ -1114,6 +1215,7 @@
       if (t - lastSnap >= 100) { lastSnap = t; frames.push(snapshotFrame(t)); }
     }
     CLOCK = null; Deriving.on = false; suppressLog = false;
+    rebuildFootEventPositions(Deriving.footEvents);   // hindsight gait direction (incl. backfill)
     Session.frames = frames; Session.footEvents = Deriving.footEvents; Session.durationMs = duration;
     return frames.length;
   }
@@ -1196,6 +1298,7 @@
       // full relative orientation + step height per foot (3D shoes)
       updateFootOrientation("left", gr0.footL, grQuat(nearest(GR.footL, t)), loadL);
       updateFootOrientation("right", gr0.footR, grQuat(nearest(GR.footR, t)), loadR);
+      GaitDir.tick("left", loadL, S.copFoot.left.y, t); GaitDir.tick("right", loadR, S.copFoot.right.y, t);
       onSideLoad("left", loadL); onSideLoad("right", loadR);
       S.sideLoad.left = loadL; S.sideLoad.right = loadR;
       const wsum = Math.max(0.001, loadL + loadR);
@@ -1206,6 +1309,7 @@
       if (t - lastSnap >= 100) { lastSnap = t; frames.push(snapshotFrame(t)); }
     }
     CLOCK = null; Deriving.on = false; suppressLog = false;
+    rebuildFootEventPositions(Deriving.footEvents);   // hindsight gait direction (incl. backfill)
     Session.frames = frames; Session.footEvents = Deriving.footEvents; Session.durationMs = duration;
     const has = { footL: !!ids.footL, footR: !!ids.footR, torso: !!ids.torso, pelvis: !!ids.pelvis, gameRotation: (GR.torso.length + GR.footL.length + GR.footR.length) > 0 };
     log(`Portal export: feet[${has.footL ? "L" : "–"}${has.footR ? "R" : "–"}] torso:${has.torso ? "y" : "–"} pelvis:${has.pelvis ? "y" : "–"} gameRotation:${has.gameRotation ? "y" : "NO (no posture/heading)"}.`, has.gameRotation ? "" : "warn");
@@ -1459,7 +1563,7 @@
   };
 
   // expose read-only state for the 3D stance module (stance3d.js, ES module)
-  window.WH = { S, CFG, PAD_NORM, Session };
+  window.WH = { S, CFG, PAD_NORM, Session, GaitDir };
 
   ShoeStage.init();
   setExportAvailable(false);
