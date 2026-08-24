@@ -167,6 +167,19 @@
     const tx = 2 * (y * vz - z * vy), ty = 2 * (z * vx - x * vz), tz = 2 * (x * vy - y * vx);
     return [vx + w * tx + (y * tz - z * ty), vy + w * ty + (z * tx - x * tz), vz + w * tz + (x * ty - y * tx)];
   }
+  // Horizontal heading (deg) of a segment vs its rest pose — the rotation about the
+  // WORLD vertical only. Euler yaw of the relative quaternion goes haywire when the
+  // foot pitches steeply mid-swing (WE 5: left foot read 141–164° during swing while
+  // the video showed both feet parallel), and steps are placed right after swing, so
+  // footprints were stamped with garbage. Track a rest-horizontal reference vector
+  // instead and measure its bearing; returns null when the foot points near-vertical.
+  function headingDegQ(rest, live) {
+    if (!rest || !live) return null;
+    const fDev = rotateVec(quatConj(rest), [0, 0, 1]);  // world-horizontal reference in device frame at rest
+    const v = rotateVec(live, fDev);
+    if (Math.hypot(v[0], v[2]) < 0.2) return null;       // near-vertical — heading undefined
+    return Math.atan2(v[0], v[2]) * 180 / Math.PI;       // 0 at rest by construction
+  }
 
   function updatePosture() {
     const f = S.flexion;
@@ -857,13 +870,26 @@
           const torsoOk = inFrame(p[11]) && inFrame(p[12]) && inFrame(p[23]) && inFrame(p[24]) && (hipY - shoulderY) > 0.08
             && Math.min(lmVis(p[11]), lmVis(p[12]), lmVis(p[23]), lmVis(p[24])) >= 0.5;
           const torso = Math.max(0.03, hipY - shoulderY);
+          // Facing: MediaPipe labels landmarks by BODY side, so facing the camera puts the
+          // subject's left foot on the image's RIGHT — using image-x raw mirrors the feet
+          // (WE 5 rendered them crossed). The hips' image order gives the facing sign
+          // (left hip right of right hip ⇔ facing camera ⇒ mirror). In PROFILE the hips
+          // collapse in x and lateral positions are meaningless ⇒ confidence 0.
+          // Facing from the SHOULDERS: hips are too narrow in image-x (facing-camera
+          // frames measured hip width 0.15–0.25 torso-units vs shoulders 0.23–0.49 on
+          // WE 5 — a hip gate rejected every frame). Sign: subject's left shoulder on
+          // the image's right ⇔ facing camera ⇒ mirror body-side x. Width < 0.15 ⇒
+          // profile/turned ⇒ sign unreliable ⇒ confidence 0.
+          const shDx = p[11].x - p[12].x;                  // left shoulder − right shoulder, image x
+          const facingKnown = Math.abs(shDx) / torso >= 0.15;
+          const faceSign = shDx > 0 ? -1 : 1;              // toward camera ⇒ mirror
           const foot = (ank, heel) => {
             const a = p[ank], h = p[heel]; if (!a || !h) return null;
             // visibility is often UNDEFINED in VIDEO mode — treat unknown as 0, never 0.5
             // (defaulting to 0.5 let unreliable frames through the confidence gate)
             const vis = Math.min(a.visibility ?? 0, h.visibility ?? 0);
-            const c = (inFrame(a) && inFrame(h)) ? vis : 0;
-            return { xn: a.x - hipX, hh: (h.y - hipY) / torso, zw: (res.worldLandmarks?.[0]?.[ank]?.z ?? null), vis: c, torsoOk };
+            const c = (inFrame(a) && inFrame(h) && facingKnown) ? vis : 0;
+            return { xn: (a.x - hipX) * faceSign, hh: (h.y - hipY) / torso, zw: (res.worldLandmarks?.[0]?.[ank]?.z ?? null), vis: c, torsoOk };
           };
           l = foot(27, 29); r = foot(28, 30);
         }
@@ -1044,19 +1070,31 @@
     S.baselinePelvis = streams.pelvis ? quatOf(at(streams.pelvis, 0)) : null;
     // per-foot heading baselines (relative insole orientation, deg): first-sample yaw
     const gr0 = { left: streams.footLgr ? quatOf(at(streams.footLgr, 0)) : null, right: streams.footRgr ? quatOf(at(streams.footRgr, 0)) : null };
-    const footYawAt = (grStream, base, t, flare) => {
+    // Per-foot heading ZERO = median heading over the clip (feet are planted most of
+    // the time), so each insole's typical planted direction maps to the wearer's
+    // toe-out flare. First-sample zeroing baked in per-device mounting/reference
+    // bias — WE 5's planted feet disagreed by a median 42° when flare predicts ~22°.
+    const yawZeroOf = (grStream, base) => {
+      if (!grStream || !base) return 0;
+      const hs = [];
+      for (let tt = 0; tt <= duration; tt += 250) { const q = quatOf(at(grStream, tt)); if (!q) continue; const h = headingDegQ(base, q); if (h != null) hs.push(h); }
+      if (!hs.length) return 0;
+      hs.sort((a, b) => a - b); return hs[Math.floor(hs.length / 2)];
+    };
+    const yawZero = { left: yawZeroOf(streams.footLgr, gr0.left), right: yawZeroOf(streams.footRgr, gr0.right) };
+    const footYawAt = (grStream, base, zero, t, flare) => {
       if (!grStream || !base) return flare; // no insole IMU → natural flare
       const q = quatOf(at(grStream, t)); if (!q) return flare;
-      const rel = quatMul(quatConj(base), q);
-      return flare + quatToEuler(rel).yaw;
+      const h = headingDegQ(base, q);      // horizontal heading — robust in swing (see headingDegQ)
+      return h == null ? flare : flare + h - zero;
     };
     Deriving.on = true; Deriving.footEvents = []; suppressLog = true;
     const frames = []; let lastSnap = -1000; const STEP = 50;
     for (let t = 0; t <= duration; t += STEP) {
       CLOCK = t;
       // per-foot yaw FIRST so a step detected this tick stamps its print with the current orientation
-      S.footYaw.left = footYawAt(streams.footLgr, gr0.left, t, -11);
-      S.footYaw.right = footYawAt(streams.footRgr, gr0.right, t, 11);
+      S.footYaw.left = footYawAt(streams.footLgr, gr0.left, yawZero.left, t, -11);
+      S.footYaw.right = footYawAt(streams.footRgr, gr0.right, yawZero.right, t, 11);
       const sL = sensorObjs(streams.footL, rL, t), sR = sensorObjs(streams.footR, rR, t);
       let loadL = 0.5, loadR = 0.5;
       if (sL) { mapSensorsToPads("left", sL); loadL = sL.reduce((a, b) => a + b.normalizedValue, 0) / (sL.length || 1); }
@@ -1127,7 +1165,16 @@
     S.baselineTorso = grQuat(nearest(GR.torso, 0)) || eulerToQuat(0, 0, 0);
     S.baselinePelvis = grQuat(nearest(GR.pelvis, 0)) || null;
     const gr0 = { footL: grQuat(nearest(GR.footL, 0)), footR: grQuat(nearest(GR.footR, 0)) };
-    const footYawFrom = (rows, base, t, flare) => { const q = grQuat(nearest(rows, t)); if (!q || !base) return flare; return flare + quatToEuler(quatMul(quatConj(base), q)).yaw; };
+    // Median-heading zero per foot (see yawZeroOf in the SDK-nested path).
+    const yawZeroFrom = (rows, base) => {
+      if (!rows || !rows.length || !base) return 0;
+      const hs = [];
+      for (const row of rows) { const q = grQuat(row); if (!q) continue; const h = headingDegQ(base, q); if (h != null) hs.push(h); }
+      if (!hs.length) return 0;
+      hs.sort((a, b) => a - b); return hs[Math.floor(hs.length / 2)];
+    };
+    const yawZero = { left: yawZeroFrom(GR.footL, gr0.footL), right: yawZeroFrom(GR.footR, gr0.footR) };
+    const footYawFrom = (rows, base, zero, t, flare) => { const q = grQuat(nearest(rows, t)); if (!q || !base) return flare; const h = headingDegQ(base, q); return h == null ? flare : flare + h - zero; };
 
     Deriving.on = true; Deriving.footEvents = []; suppressLog = true;
     const frames = []; let lastSnap = -1000; const STEP = 50;
@@ -1143,8 +1190,8 @@
     for (let t = 0; t <= duration; t += STEP) {
       CLOCK = t;
       // per-foot yaw FIRST so a step detected this tick stamps its print with the current orientation
-      S.footYaw.left = footYawFrom(GR.footL, gr0.footL, t, -11);
-      S.footYaw.right = footYawFrom(GR.footR, gr0.footR, t, 11);
+      S.footYaw.left = footYawFrom(GR.footL, gr0.footL, yawZero.left, t, -11);
+      S.footYaw.right = footYawFrom(GR.footR, gr0.footR, yawZero.right, t, 11);
       const loadL = doFoot("left", "footL"), loadR = doFoot("right", "footR");
       // full relative orientation + step height per foot (3D shoes)
       updateFootOrientation("left", gr0.footL, grQuat(nearest(GR.footL, t)), loadL);

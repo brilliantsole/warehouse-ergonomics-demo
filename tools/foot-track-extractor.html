@@ -160,12 +160,17 @@ runBtn.addEventListener("click", async () => {
       const torsoOk = inFrame(lm[11]) && inFrame(lm[12]) && inFrame(lm[23]) && inFrame(lm[24]) && (hipY - shoulderY) > 0.08
         && Math.min(lmVis(lm[11]), lmVis(lm[12]), lmVis(lm[23]), lmVis(lm[24])) >= 0.5;
       const torso = Math.max(0.03, hipY - shoulderY);
+      // Facing sign + profile gate (see app.js): body-side landmarks mirror when facing
+      // the camera; in profile the lateral gap is meaningless. Kept in sync with app.js.
+      const shDx = lm[11].x - lm[12].x;                // shoulders, not hips — see app.js
+      const facingKnown = Math.abs(shDx) / torso >= 0.15;
+      const faceSign = shDx > 0 ? -1 : 1;
       const foot = (ank, heel, toe) => {
         const a = lm[ank]; if (!a || !heel) return null;
         const vis = Math.min(a.visibility ?? 0, heel.visibility ?? 0); // unknown visibility = 0, not 0.5
-        const c = (inFrame(a) && inFrame(heel)) ? vis : 0;
+        const c = (inFrame(a) && inFrame(heel) && facingKnown) ? vis : 0;
         const zProxy = depthMap ? depthAt(a.x, a.y) : null;
-        return { xn: a.x - hipX, hh: (heel.y - hipY) / torso, z: zProxy, vis: c, torsoOk };
+        return { xn: (a.x - hipX) * faceSign, hh: (heel.y - hipY) / torso, z: zProxy, vis: c, torsoOk };
       };
       l = foot(27, lm[29], lm[31]);
       r = foot(28, lm[30], lm[32]);

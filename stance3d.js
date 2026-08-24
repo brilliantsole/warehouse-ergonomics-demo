@@ -169,6 +169,11 @@ async function boot() {
   }
 
   function update() {
+    // Crossed-feet guard: if vision claims the left foot is to the RIGHT of the right
+    // foot (mirror/noise residue), ignore vision positions this frame — never render
+    // the shoes crossed/overlapping.
+    const fpL = S.footPos && S.footPos.left, fpR = S.footPos && S.footPos.right;
+    const visCrossed = !!(fpL && fpR && fpL.c >= 0.6 && fpR.c >= 0.6 && fpL.x > fpR.x);
     for (const side of ["left", "right"]) {
       const fr = feet[side];
       // Orientation: the foot's FULL relative quaternion (inverse(rest)·live) composed
@@ -191,7 +196,7 @@ async function boot() {
       // tilted = foot in the air) — vision never supplies lift; see app.js.
       const fp = S.footPos && S.footPos[side];
       const liftY = (S.footLift && S.footLift[side] ? S.footLift[side] : 0) * POS_SCALE;
-      if (S.useVision && fp && fp.c >= 0.6) {   // matches app.js VISION_MIN_CONF
+      if (S.useVision && fp && fp.c >= 0.6 && !visCrossed) {   // matches app.js VISION_MIN_CONF
         fr.basePos.set(fp.x * POS_SCALE, 0, -fp.z * POS_SCALE);
       } else {
         fr.basePos.copy(fr.defaultPos);
