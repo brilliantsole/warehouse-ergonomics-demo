@@ -506,15 +506,31 @@
     const oy = (h - (maxY - minY) * scale) / 2 - minY * scale;
     const P = (p) => [p.x * scale + ox, p.y * scale + oy];
 
-    // connecting arrows in stride order
+    // Connecting path in stride order, with an ARROWHEAD per segment showing the
+    // direction of TRAVEL. The glyphs show where the toes POINT — when the two
+    // oppose, the wearer is walking backwards. At map scale the toe/heel
+    // asymmetry alone is too subtle to read (field report: a correct backward
+    // bout was read as forward from the path direction), so travel gets its own
+    // explicit affordance.
     for (let i = 1; i < fresh.length; i++) {
       const a = P(fresh[i - 1]), b = P(fresh[i]);
       const age = (t - fresh[i].t) / MAP.windowMs;
       mapCtx.strokeStyle = `rgba(154,163,199,${0.45 * (1 - age)})`;
       mapCtx.lineWidth = 1.5;
       mapCtx.beginPath(); mapCtx.moveTo(a[0], a[1]); mapCtx.lineTo(b[0], b[1]); mapCtx.stroke();
+      const dxs = b[0] - a[0], dys = b[1] - a[1];
+      if (Math.hypot(dxs, dys) > 14) {
+        mapCtx.save();
+        mapCtx.translate((a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+        mapCtx.rotate(Math.atan2(dys, dxs));
+        mapCtx.fillStyle = `rgba(238,241,255,${0.55 * (1 - age)})`;
+        mapCtx.beginPath(); mapCtx.moveTo(5, 0); mapCtx.lineTo(-3, -4); mapCtx.lineTo(-3, 4); mapCtx.closePath(); mapCtx.fill();
+        mapCtx.restore();
+      }
     }
     // footprints
+    // Glyphs grow with the view zoom so the toe/heel asymmetry stays readable.
+    const G = Math.max(1.25, Math.min(2.4, scale / 40));
     fresh.forEach((p) => {
       const [x, y] = P(p);
       const age = (t - p.t) / MAP.windowMs;
@@ -523,6 +539,7 @@
       mapCtx.save();
       mapCtx.translate(x, y);
       mapCtx.rotate((p.heading * Math.PI) / 180);
+      mapCtx.scale(G, G);
       // sole
       mapCtx.fillStyle = color;
       mapCtx.beginPath();
@@ -536,7 +553,7 @@
       // sequence number
       mapCtx.fillStyle = `rgba(238,241,255,${Math.max(0.25, 1 - age)})`;
       mapCtx.font = "600 9px sans-serif"; mapCtx.textAlign = "center";
-      mapCtx.fillText(p.n, x + (p.side === "left" ? -12 : 12), y + 3);
+      mapCtx.fillText(p.n, x + (p.side === "left" ? -13 : 13) * G, y + 3);
     });
     if (S.mapFrame === "camera") {
       // camera indicator — the map is in the VIDEO's frame: camera at the bottom
@@ -1057,9 +1074,10 @@
     const fr = F[idx], p = fr[side === "left" ? "l" : "r"];
     let dx = 0, dy = 0;
     if (p && p.c >= VISION_MIN_CONF && fr.f) {
-      // track x is hip-relative, ×WS(1.6), mirrored to BODY side by the facing
-      // sign — undo both to get the image offset, then scale by depth for metres
-      dx = (p.x / 1.6) * fr.f * body.d * VIS_FNORM;
+      // track x is hip-relative, ×WS(1.6), mirrored to the BODY frame by
+      // faceSign = −f — undo both (×(−f), ÷1.6) for the image offset, then
+      // scale by depth for metres
+      dx = -(p.x / 1.6) * fr.f * body.d * VIS_FNORM;
       dy = -(p.z || 0);   // hip-relative depth (+ = away) → up the map
     }
     return { x: body.x + dx, y: body.y + dy, bx: body.x, by: body.y };
@@ -1224,7 +1242,16 @@
   }
 
   function applyFootPos(fr) {
-    const put = (side, p) => { S.footPos[side] = p && p.c >= VISION_MIN_CONF ? { x: p.x, y: p.y || 0, z: p.z || 0, c: p.c } : { ...S.footPos[side], c: 0 }; };
+    // Track x is in the BODY frame (the extractor mirrors by the facing sign so
+    // "left foot" is always negative-x). The 3D scene is the ROOM/camera frame —
+    // rendering body-x directly put the left shoe on the viewer's left even when
+    // the wearer faces the camera (their left is on the VIDEO's right), so the
+    // shoes read swapped vs the footage. Multiply by the frame's facing sign to
+    // return to the room frame; in profile (f = 0) confidence is already 0.
+    // NOTE the sign: the extractor's mirror factor is faceSign = −f (facing camera
+    // stores f = +1 but mirrored with faceSign = −1), so undoing it is ×(−f).
+    const f = (fr && fr.f) || 0;
+    const put = (side, p) => { S.footPos[side] = p && p.c >= VISION_MIN_CONF && f ? { x: -p.x * f, y: p.y || 0, z: p.z || 0, c: p.c } : { ...S.footPos[side], c: 0 }; };
     put("left", fr && fr.l); put("right", fr && fr.r);
   }
   function setVisionAvailable(avail) {
