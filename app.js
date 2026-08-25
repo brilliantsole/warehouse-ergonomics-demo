@@ -377,6 +377,7 @@
     if (!GaitDir.effective().length || !evs.length) return;
     const w = { x: 0, y: 0 };
     for (const ev of evs) {
+      if (ev.visPos) { w.x = ev.x; w.y = ev.y; continue; }   // measured by the camera — keep; anchor the chain here
       const dir = GaitDir.dirAt(ev.t);
       // Same rules as placeFootprint: path advances along the BODY heading (ev.adv),
       // and only when the step was genuine gait (ev.walk) — weight shifts stay put.
@@ -410,6 +411,19 @@
   }
   function placeFootprint(side, t) {
     const headingDeg = footHeadingDeg(side);
+    // MEASURED position first: when the foot-track carries the body path (hx),
+    // this step lands where the camera saw it — no stride guessing, no drift,
+    // loops close. The walker follows the measured body so any unmeasured
+    // stretch dead-reckons onward from reality.
+    const vp = Deriving.on ? visPrintPos(t, side) : null;
+    if (vp) {
+      S.walker.x = vp.bx; S.walker.y = vp.by;
+      S.stepSeq++;
+      S.footprints.push({ x: vp.x, y: vp.y, side, n: S.stepSeq, t, heading: headingDeg });
+      while (S.footprints.length && t - S.footprints[0].t > MAP.windowMs) S.footprints.shift();
+      Deriving.footEvents.push({ t, x: vp.x, y: vp.y, side, n: S.stepSeq, heading: headingDeg, visPos: 1, hasVis: false });
+      return;
+    }
     // The PATH advances along the BODY direction (circular mean of both feet) —
     // advancing along each stepping foot's own splayed heading sawtoothed the path
     // by the full L/R flare every step. Each GLYPH still faces its own insole's
@@ -524,8 +538,19 @@
       mapCtx.font = "600 9px sans-serif"; mapCtx.textAlign = "center";
       mapCtx.fillText(p.n, x + (p.side === "left" ? -12 : 12), y + 3);
     });
-    if (S.magMap) {
-      // compass rose — this map is true-north referenced (mag-fused insole headings)
+    if (S.mapFrame === "camera") {
+      // camera indicator — the map is in the VIDEO's frame: camera at the bottom
+      // edge looking up the map, so it reads side-by-side with the footage
+      mapCtx.save();
+      mapCtx.translate(w / 2, h - 10);
+      mapCtx.strokeStyle = "rgba(238,241,255,.55)"; mapCtx.fillStyle = "rgba(238,241,255,.7)";
+      mapCtx.lineWidth = 1.5;
+      mapCtx.beginPath(); mapCtx.moveTo(-7, 4); mapCtx.lineTo(7, 4); mapCtx.lineTo(4, -3); mapCtx.lineTo(-4, -3); mapCtx.closePath(); mapCtx.stroke();
+      mapCtx.font = "600 9px sans-serif"; mapCtx.textAlign = "center";
+      mapCtx.fillText("camera", 0, -7);
+      mapCtx.restore();
+    } else if (S.magMap) {
+      // compass rose — headings are true-north referenced (mag-fused insoles)
       mapCtx.save();
       mapCtx.translate(w - 18, 20);
       mapCtx.strokeStyle = "rgba(238,241,255,.55)"; mapCtx.fillStyle = "rgba(238,241,255,.75)";
@@ -983,6 +1008,62 @@
     while (lo <= hi) { const m = (lo + hi) >> 1; if (F[m].t <= vt) { idx = m; lo = m + 1; } else hi = m - 1; }
     return F[idx];
   }
+  // ── Vision-measured MAP positions (camera frame) ─────────────────────────────
+  // With the hip's absolute image-x (hx, newer tracks) + shoulder width (bs) the
+  // track yields the BODY's real room path: depth from shoulder width (pinhole:
+  // D = K / bs, K ≈ shoulder width 0.37 m × normalized focal ≈ 0.96) and lateral
+  // from the hip image offset × depth. Dead reckoning (stride guesses along
+  // headings) drifts and cannot close loops; the camera watches the whole room,
+  // so the map takes its print positions from it whenever the data allows.
+  const VIS_K = 0.355, VIS_FNORM = 1.04;
+  function buildVisPath() {
+    Session.visPath = null;
+    const ft = Session.footTrack, F = ft && ft.frames;
+    // any-frame check — the FIRST frame often has no detection (wearer starts
+    // half out of frame right at the camera), and hx is null on no-detection frames
+    if (!F || !F.length || !F.some((f) => f.hx != null)) return;
+    // Shoulder width is a depth proxy ONLY while the shoulders are square to the
+    // camera (track f = ±1). In PROFILE the shoulders collapse in image-x, bs
+    // shrinks toward zero and D = K/bs exploded to 15+ m in a 5 m room — gate on
+    // facing and hold the last square-on width through profile stretches. Depth
+    // is also clamped to a sane indoor range.
+    const bsUsable = F.map((f) => (f.f !== 0 && (f.bs || 0) > 0.02 ? f.bs : 0));
+    const path = [];
+    let lastBs = 0;
+    for (let i = 0; i < F.length; i++) {
+      // median-smooth over ±2 usable frames; hold-last through gaps/profiles
+      const win = [];
+      for (let j = Math.max(0, i - 2); j <= Math.min(F.length - 1, i + 2); j++) if (bsUsable[j] > 0) win.push(bsUsable[j]);
+      win.sort((a, b) => a - b);
+      const bs = win.length ? win[Math.floor(win.length / 2)] : lastBs;
+      if (bs > 0) lastBs = bs;
+      if (!(lastBs > 0) || F[i].hx == null) { path.push(null); continue; }
+      const D = Math.max(0.8, Math.min(8, VIS_K / lastBs));
+      path.push({ x: (F[i].hx - 0.5) * D * VIS_FNORM, y: -D, d: D });
+    }
+    Session.visPath = path;
+  }
+  // Measured print position for a step: body path point + this foot's own offset.
+  // Returns {x, y, bx, by} (print + body) or null when the moment isn't measured.
+  function visPrintPos(sessionMs, side) {
+    const ft = Session.footTrack, P = Session.visPath;
+    if (!P) return null;
+    const vt = sessionMs - (ft.video?.syncOffsetMs || 0);
+    const F = ft.frames;
+    let lo = 0, hi = F.length - 1, idx = 0;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (F[m].t <= vt) { idx = m; lo = m + 1; } else hi = m - 1; }
+    const body = P[idx];
+    if (!body) return null;
+    const fr = F[idx], p = fr[side === "left" ? "l" : "r"];
+    let dx = 0, dy = 0;
+    if (p && p.c >= VISION_MIN_CONF && fr.f) {
+      // track x is hip-relative, ×WS(1.6), mirrored to BODY side by the facing
+      // sign — undo both to get the image offset, then scale by depth for metres
+      dx = (p.x / 1.6) * fr.f * body.d * VIS_FNORM;
+      dy = -(p.z || 0);   // hip-relative depth (+ = away) → up the map
+    }
+    return { x: body.x + dx, y: body.y + dy, bx: body.x, by: body.y };
+  }
   // ---------- automatic vision foot-track (MediaPipe Pose on the recording's video) ----------
   // No separate tool: when a recording has a video but no foot-track, Pose runs over
   // the clip in the background (~10–15 fps sampling) and vision switches on when done.
@@ -1015,10 +1096,11 @@
         if (this.cancelled) { this.running = false; return null; }
         await seek(t);
         const res = lm.detectForVideo(v, Math.round(t * 1000));
-        let l = null, r = null, bs = null, fc = 0;
+        let l = null, r = null, bs = null, fc = 0, hx = null;
         if (res.landmarks && res.landmarks[0]) {
           const p = res.landmarks[0];
           const hipX = (p[23].x + p[24].x) / 2;                 // hip-relative X: camera pan doesn't shift both feet
+          hx = +hipX.toFixed(4);                                // ABSOLUTE hip image-x — the body's room path (map positions)
           // Use the HEEL (29/30) as the ground-contact point for lift (the ankle sits
           // ~8 cm above the sole and biases lift up); ankle (27/28) for X/Z.
           // A foot is only trustworthy when its landmarks are INSIDE the frame: when the
@@ -1073,7 +1155,7 @@
           };
           l = foot(27, 29); r = foot(28, 30);
         }
-        raw.push({ t: Math.round(t * 1000), l, r, bs, f: fc });
+        raw.push({ t: Math.round(t * 1000), l, r, bs, f: fc, hx });
         onProgress?.(Math.min(1, t / dur));
       }
       this.running = false;
@@ -1100,7 +1182,7 @@
       // Z from Pose world landmarks (metres, hip-relative, + = away) — monocular, so relative not metric.
       const conv = (s) => s ? { x: +(s.xn * WS).toFixed(3), y: 0, z: +((s.zw != null ? -s.zw : 0) * ZS).toFixed(3), c: +Math.max(0, Math.min(1, s.vis)).toFixed(2) } : { x: 0, y: 0, z: 0, c: 0 };
       v.removeAttribute("src"); v.load?.();
-      return { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose (auto, in-app)", bodyVisible: +bodyVisible.toFixed(2), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r), bs: f.bs, f: f.f })) };
+      return { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose (auto, in-app)", bodyVisible: +bodyVisible.toFixed(2), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r), bs: f.bs, f: f.f, hx: f.hx })) };
     },
   };
 
@@ -1164,7 +1246,7 @@
       redTotalMs: 0, redSince: null, copTrail: [], copHistory: [],
       baselineTorso: null, baselinePelvis: null, calSamples: [], pelvisFlexion: null,
       footprints: [], stepSeq: 0, walker: { x: 0, y: 0 }, heading: 0, gaitDir: 1,
-      footNorthDeg: { left: 0, right: 0 }, magMap: false,
+      footNorthDeg: { left: 0, right: 0 }, magMap: false, mapFrame: "mag", camRotDeg: 0,
       sensors: { left: new Array(8).fill(0), right: new Array(8).fill(0) },
     });
     GaitDir.reset();
@@ -1240,6 +1322,7 @@
     };
 
     resetSession();
+    buildVisPath();   // measured body path (camera frame) for footprint positions
     S.baselineTorso = streams.torso ? quatOf(at(streams.torso, 0)) : eulerToQuat(0, 0, 0);
     S.baselinePelvis = streams.pelvis ? quatOf(at(streams.pelvis, 0)) : null;
     // per-foot heading baselines (relative insole orientation, deg): first-sample yaw
@@ -1349,6 +1432,7 @@
     const duration = (() => { let d = 1000; for (const s of [P.footL, P.footR, GR.torso, GR.pelvis, GR.footL, GR.footR]) if (s && s.length) d = Math.max(d, s[s.length - 1].t); return d; })();
 
     resetSession();
+    buildVisPath();   // measured body path (camera frame) for footprint positions
     const grQuat = (r) => (r && r.w != null ? { x: r.x, y: r.y, z: r.z, w: r.w } : null);
     S.baselineTorso = grQuat(nearest(GR.torso, 0)) || eulerToQuat(0, 0, 0);
     S.baselinePelvis = grQuat(nearest(GR.pelvis, 0)) || null;
@@ -1374,21 +1458,63 @@
     const magFold = magFoldFor(magMed.left, magMed.right);
     const useMag = { left: magHs.left.length > 20, right: magHs.right.length > 20 };
     S.magMap = !!(useMag.left || useMag.right);
-    const magHold = {
-      left: { v: magHs.left.length ? wrap180(magHs.left[0] + magFold.left) : -11 },
-      right: { v: magHs.right.length ? wrap180(magHs.right[0] + magFold.right) : 11 },
-    };
-    const magYawAt = (rows, fold, t, hold) => {
+    // ── Static per-board bias calibration (golf's stanceYawOffset, generalized).
+    // Absolute per-foot mag headings carry per-session, per-unit bias (soft/hard-
+    // iron distortion: WE 6 measured a 55° L/R gap where WE 5 measured ~1° —
+    // anatomy doesn't do that). Trust the mag for the SHARED centreline and for
+    // TURNS; pin the static L/R splay to a clamped flare split symmetrically about
+    // the centreline. Each foot keeps its own dynamics — only the constant offset
+    // is calibrated out.
+    const MAX_FLARE_PER_FOOT = 15; // deg
+    const medLf = magMed.left, medRf = magMed.right == null ? null : wrap180(magMed.right + magFold.right);
+    const bias = { left: 0, right: 0 };
+    if (medLf != null && medRf != null) {
+      const psi = wrap180(medRf - medLf);
+      const psiC = Math.max(-2 * MAX_FLARE_PER_FOOT, Math.min(2 * MAX_FLARE_PER_FOOT, psi));
+      const centre = wrap180(medLf + psi / 2);
+      bias.left = wrap180(medLf - (centre - psiC / 2));
+      bias.right = wrap180(medRf - (centre + psiC / 2));
+    }
+    // ── Camera-frame rotation: when a foot-track exists, rotate ALL headings into
+    // the VIDEO's frame — toe-toward-camera = 180° = down the map, camera at the
+    // bottom edge — so map + 3D read side-by-side with the video. Anchor: while
+    // the wearer FACES the camera (track f = +1) their toes point camera-ward, so
+    // the median calibrated heading over those moments maps to 180. Without a
+    // track, headings stay compass (N rose).
+    const off = { left: magFold.left - bias.left, right: magFold.right - bias.right };
+    const rawYawAt = (rows, o, t) => { const h = magHeadingDeg(grQuat(nearest(rows, t))); return h == null ? null : wrap180(h + o); };
+    let camRot = 0; S.mapFrame = "mag";
+    const ftFrames = Session.footTrack && Session.footTrack.frames;
+    if (S.magMap && ftFrames && ftFrames.length) {
+      const offMs = Session.footTrack.video?.syncOffsetMs || 0;
+      const hs = [];
+      for (const fr of ftFrames) {
+        if (fr.f !== 1) continue;
+        const tt = fr.t + offMs;
+        const hL = useMag.left ? rawYawAt(ROT.footL, off.left, tt) : null;
+        const hR = useMag.right ? rawYawAt(ROT.footR, off.right, tt) : null;
+        if (hL != null) hs.push(hL);
+        if (hR != null) hs.push(hR);
+      }
+      if (hs.length >= 10) { camRot = wrap180(180 - medianHeading(hs)); S.mapFrame = "camera"; }
+    }
+    S.camRotDeg = camRot;
+    off.left = wrap180(off.left + camRot); off.right = wrap180(off.right + camRot);
+    const magYawAt = (rows, o, t, hold) => {
       const h = magHeadingDeg(grQuat(nearest(rows, t)));
-      if (h != null) hold.v = wrap180(h + fold);
+      if (h != null) hold.v = wrap180(h + o);
       return hold.v;   // near-vertical mid-swing → hold last valid heading
     };
-    // North anchor for the 3D stance: each foot's mag heading at its rest instant.
-    S.footNorthDeg = {
-      left: useMag.left ? magYawAt(ROT.footL, magFold.left, rT.footL, { v: magHold.left.v }) : 0,
-      right: useMag.right ? magYawAt(ROT.footR, magFold.right, rT.footR, { v: magHold.right.v }) : 0,
+    const magHold = {
+      left: { v: useMag.left ? magYawAt(ROT.footL, off.left, 0, { v: -11 }) : -11 },
+      right: { v: useMag.right ? magYawAt(ROT.footR, off.right, 0, { v: 11 }) : 11 },
     };
-    const magLogLine = S.magMap ? `Magnetometer headings live: L median ${magMed.left == null ? "–" : magMed.left.toFixed(0) + "°"}, R median ${magMed.right == null ? "–" : magMed.right.toFixed(0) + "°"}${magFold.right ? " (right board folded 180°)" : ""} — footprints + 3D stance are true-north referenced.` : null;
+    // Anchor for the 3D stance: each foot's heading at its rest instant (same frame as the map).
+    S.footNorthDeg = {
+      left: useMag.left ? magYawAt(ROT.footL, off.left, rT.footL, { v: magHold.left.v }) : 0,
+      right: useMag.right ? magYawAt(ROT.footR, off.right, rT.footR, { v: magHold.right.v }) : 0,
+    };
+    const magLogLine = S.magMap ? `Mag headings live — ${S.mapFrame === "camera" ? "CAMERA frame (compare directly with the video; camera at the bottom edge)" : "compass frame"}. L median ${medLf == null ? "–" : medLf.toFixed(0) + "°"}, R median ${medRf == null ? "–" : medRf.toFixed(0) + "°"}${magFold.right ? ", right board folded 180°" : ""}${(bias.left || bias.right) ? `, L/R splay ${Math.abs(wrap180(medRf - medLf)).toFixed(0)}° calibrated to ≤${2 * MAX_FLARE_PER_FOOT}°` : ""}.` : null;
     // Median-heading zero per foot (see yawZeroOf in the SDK-nested path).
     const yawZeroFrom = (rows, base) => {
       if (!rows || !rows.length || !base) return 0;
@@ -1414,8 +1540,8 @@
     for (let t = 0; t <= duration; t += STEP) {
       CLOCK = t;
       // per-foot yaw FIRST so a step detected this tick stamps its print with the current orientation
-      S.footYaw.left = useMag.left ? magYawAt(ROT.footL, magFold.left, t, magHold.left) : footYawFrom(GR.footL, gr0.footL, yawZero.left, t, -11);
-      S.footYaw.right = useMag.right ? magYawAt(ROT.footR, magFold.right, t, magHold.right) : footYawFrom(GR.footR, gr0.footR, yawZero.right, t, 11);
+      S.footYaw.left = useMag.left ? magYawAt(ROT.footL, off.left, t, magHold.left) : footYawFrom(GR.footL, gr0.footL, yawZero.left, t, -11);
+      S.footYaw.right = useMag.right ? magYawAt(ROT.footR, off.right, t, magHold.right) : footYawFrom(GR.footR, gr0.footR, yawZero.right, t, 11);
       const loadL = doFoot("left", "footL"), loadR = doFoot("right", "footR");
       // full relative orientation + step height per foot (3D shoes)
       updateFootOrientation("left", gr0.footL, grQuat(nearest(GR.footL, t)), loadL);
@@ -1618,7 +1744,7 @@
       log(`Loading “${entry.title || entry.id}”…`);
       Session.footTrack = null;
       const raw = await fetch(entry.json).then((r) => { if (!r.ok) throw new Error(`data ${r.status}`); return r.json(); });
-      if (entry.footTrack) Session.footTrack = await fetch(entry.footTrack).then((r) => r.ok ? r.json() : null).catch(() => null);
+      if (entry.footTrack) Session.footTrack = await fetch(entry.footTrack, { cache: "no-store" }).then((r) => r.ok ? r.json() : null).catch(() => null); // no-store: a stale cached track once shadowed a re-baked one (hx missing)
       const isPortal = raw && raw.recording && (Array.isArray(raw.scalar) || Array.isArray(raw.pressure));
       const n = isPortal ? deriveFromPortalExport(raw) : deriveFromRecording(raw);
       if (!n) { log("No usable sensor data.", "warn"); return; }
@@ -1686,7 +1812,7 @@
   };
 
   // expose read-only state for the 3D stance module (stance3d.js, ES module)
-  window.WH = { S, CFG, PAD_NORM, Session, GaitDir };
+  window.WH = { S, CFG, PAD_NORM, Session, GaitDir, FootTrackExtractor, autoExtractFootTrack, attachFootTrack };
 
   ShoeStage.init();
   setExportAvailable(false);

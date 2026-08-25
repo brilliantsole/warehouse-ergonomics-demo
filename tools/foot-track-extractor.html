@@ -140,10 +140,11 @@ runBtn.addEventListener("click", async () => {
     await seek(t);
     const res = poseLandmarker.detectForVideo(video, Math.round(t * 1000));
     octx.drawImage(video, 0, 0, overlay.width, overlay.height);
-    let l = null, r = null;
+    let l = null, r = null, bs = null, fc = 0, hx = null;
     if (res.landmarks && res.landmarks[0]) {
       const lm = res.landmarks[0];
       const hipX = (lm[23].x + lm[24].x) / 2;
+      hx = +hipX.toFixed(4);   // ABSOLUTE hip image-x — the body's room path (kept in sync with app.js)
       let depthMap = null;
       if (depthWs && depthWs.readyState === 1) { await requestDepth(video); depthMap = depthReady; }
       // Heel = ground-contact point for lift; ankle for X/Z. A foot is only trustworthy
@@ -165,6 +166,8 @@ runBtn.addEventListener("click", async () => {
       const shDx = lm[11].x - lm[12].x;                // shoulders, not hips — see app.js
       const facingKnown = inFrame(lm[11]) && inFrame(lm[12]) && Math.abs(shDx) / torso >= 0.15;
       const faceSign = shDx > 0 ? -1 : 1;
+      bs = +Math.abs(shDx).toFixed(4);                 // shoulder width — depth proxy + gait-direction cue (see app.js)
+      fc = facingKnown ? (shDx > 0 ? 1 : -1) : 0;      // +1 facing camera, −1 away, 0 profile/cropped
       const foot = (ank, heel, toe) => {
         const a = lm[ank]; if (!a || !heel) return null;
         const vis = Math.min(a.visibility ?? 0, heel.visibility ?? 0); // unknown visibility = 0, not 0.5
@@ -178,7 +181,7 @@ runBtn.addEventListener("click", async () => {
       octx.fillStyle = "#00d4aa"; [27, 29, 31].forEach((i) => dot(lm[i]));
       octx.fillStyle = "#6f7bff"; [28, 30, 32].forEach((i) => dot(lm[i]));
     }
-    raw.push({ t: Math.round(t * 1000), l, r });
+    raw.push({ t: Math.round(t * 1000), l, r, bs, f: fc, hx });
     $("prog").value = t / dur; $("status").textContent = `Extracting… ${(t).toFixed(1)}/${dur.toFixed(1)}s`;
   }
   // ground baseline = where the feet USUALLY are on the floor: 90th-percentile ankle-y over
@@ -194,7 +197,7 @@ runBtn.addEventListener("click", async () => {
   const allS = raw.flatMap((f) => [f.l, f.r]).filter(Boolean);
   const bodyVisible = allS.length ? allS.filter((s) => s.torsoOk).length / allS.length : 0;
   const conv = (s) => s ? { x: +(s.xn * WS).toFixed(3), y: 0, z: +(((s.z != null ? s.z : 0) - 0.5) * 2 * ZS).toFixed(3), c: +Math.max(0, Math.min(1, s.vis)).toFixed(2) } : { x: 0, y: 0, z: 0, c: 0 };
-  track = { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose" + (depthWs ? "+depth-anything-v3" : ""), bodyVisible: +bodyVisible.toFixed(2), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r) })) };
+  track = { schema: "foot-track/v1", fps, video: { syncOffsetMs: 0 }, source: "mediapipe-pose" + (depthWs ? "+depth-anything-v3" : ""), bodyVisible: +bodyVisible.toFixed(2), frames: raw.map((f) => ({ t: f.t, l: conv(f.l), r: conv(f.r), bs: f.bs, f: f.f, hx: f.hx })) };
   $("status").textContent += ` (upper body in frame ${Math.round(bodyVisible*100)}% of frames — informational; step height always comes from the insoles.)`;
   $("status").textContent = `Done — ${track.frames.length} frames. Download and load it into the demo (syncOffsetMs defaults to 0 — set it if the video started after the sensors).`;
   saveBtn.disabled = false; runBtn.disabled = false;
