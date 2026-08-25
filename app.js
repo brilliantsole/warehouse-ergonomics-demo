@@ -519,7 +519,10 @@
       mapCtx.lineWidth = 1.5;
       mapCtx.beginPath(); mapCtx.moveTo(a[0], a[1]); mapCtx.lineTo(b[0], b[1]); mapCtx.stroke();
       const dxs = b[0] - a[0], dys = b[1] - a[1];
-      if (Math.hypot(dxs, dys) > 14) {
+      // arrow only on real strides (> 0.3 m of actual displacement) — arrows on
+      // lateral foot-to-foot hops and in-place weight shifts read as noise
+      const distM = Math.hypot(fresh[i].x - fresh[i - 1].x, fresh[i].y - fresh[i - 1].y);
+      if (distM > 0.3 && Math.hypot(dxs, dys) > 14) {
         mapCtx.save();
         mapCtx.translate((a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
         mapCtx.rotate(Math.atan2(dys, dxs));
@@ -530,7 +533,9 @@
     }
     // footprints
     // Glyphs grow with the view zoom so the toe/heel asymmetry stays readable.
-    const G = Math.max(1.25, Math.min(2.4, scale / 40));
+    // (Capped: at 2.4× the number labels drifted ~30 px from their prints and the
+    // sequence became misreadable — field report "looks worse".)
+    const G = Math.max(1.25, Math.min(1.8, scale / 40));
     fresh.forEach((p) => {
       const [x, y] = P(p);
       const age = (t - p.t) / MAP.windowMs;
@@ -553,8 +558,23 @@
       // sequence number
       mapCtx.fillStyle = `rgba(238,241,255,${Math.max(0.25, 1 - age)})`;
       mapCtx.font = "600 9px sans-serif"; mapCtx.textAlign = "center";
-      mapCtx.fillText(p.n, x + (p.side === "left" ? -13 : 13) * G, y + 3);
+      mapCtx.fillText(p.n, x + (p.side === "left" ? -16 : 16), y + 3);
     });
+    // Direction banner — say it in WORDS while the wearer is walking. Reading
+    // direction from toe-vs-path geometry alone proved unreliable for viewers
+    // (three field reports), so the classifier's verdict is shown outright.
+    const newest = fresh[fresh.length - 1];
+    if (newest && t - newest.t < 2000 && fresh.length >= 2) {
+      const back = GaitDir.dirAt(newest.t) === -1;
+      const label = back ? "walking BACKWARDS" : "walking forward";
+      mapCtx.font = "700 11px sans-serif";
+      const tw = mapCtx.measureText(label).width;
+      mapCtx.fillStyle = back ? "rgba(245,158,11,.18)" : "rgba(0,212,170,.12)";
+      mapCtx.beginPath(); mapCtx.roundRect(10, 10, tw + 18, 22, 11); mapCtx.fill();
+      mapCtx.fillStyle = back ? "rgba(245,158,11,.95)" : "rgba(0,212,170,.9)";
+      mapCtx.textAlign = "left";
+      mapCtx.fillText(label, 19, 25);
+    }
     if (S.mapFrame === "camera") {
       // camera indicator — the map is in the VIDEO's frame: camera at the bottom
       // edge looking up the map, so it reads side-by-side with the footage
